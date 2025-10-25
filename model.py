@@ -1,10 +1,11 @@
 # model.py
 # ============================================================
-# Physics-aware iToF network with differentiable correlation
+# Physics-aware iToF network with differentiable correlation (From-Depth only)
 # - Global shared waveform x_k (cos+sin; post_box bounds)
 # - Differentiable 4-phase synthesis (+ optional environment)
 # - From-Depth training path with built-in paper-like sensor noise
-# - Loss: MAE + SSIM + ZNCC (+ optional frequency prior)
+# - Loss helper class: MAE + SSIM + ZNCC (+ optional frequency prior)
+# - NOTE: Measured mode has been removed. Use forward_from_depth_train().
 # ============================================================
 
 from __future__ import annotations
@@ -464,6 +465,10 @@ class PhaseMambaNet(nn.Module):
         self._noise_fpnr = (0.0,   0.005)
         self._noise_fpnc = (0.0,   0.005)
 
+    # ----- measured mode: removed -----
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError("Measured mode has been removed. Use forward_from_depth_train(gt_depth, ...).")
+
     # ----- helper: paper-like noise -----
     def paper_noise(self, img4: torch.Tensor) -> torch.Tensor:
         """
@@ -513,39 +518,6 @@ class PhaseMambaNet(nn.Module):
         else:
             return self._xk_from_post_box()
 
-    # ----- measured mode -----
-    def forward(self, four_phase: torch.Tensor):
-        device = next(self.parameters()).device
-        four_phase = four_phase.to(device)
-
-        _, depth_raw, _ = self.backbone(four_phase)
-        pred_depth = (torch.tanh(depth_raw) * 0.5 + 0.5) * self.dmax
-
-        if self.use_global_xk:
-            xk = self.get_global_xk().to(device)            # [1,2K]
-            pred_xk = xk.expand(four_phase.size(0), -1)     # [B,2K]
-        else:
-            raise NotImplementedError("Per-sample x_k disabled; set use_global_xk=True.")
-
-        extras: Dict[str, torch.Tensor] = {}
-        if self.use_corr_synth:
-            t_map = depth_to_phase_t(pred_depth)
-            # signal-only 4-phase
-            pred_four = self.corr.sample_map(pred_xk, t_map, for_zncc=False)
-            extras["pred_four_phase"]   = pred_four
-            extras["pred_four_phase01"] = self.corr.to_unit(pred_four)
-            # env-aware (for zncc/loss)
-            pred_four_env = self.corr.sample_map_env(
-                pred_xk, t_map,
-                beta=self.env_beta, kappa=self.env_kappa,
-                lam_d=self.env_lam_d, gain=self.env_gain,
-                alpha=None, use_falloff=False, for_zncc=True
-            )
-            extras["pred_four_phase_env"]   = pred_four_env
-            extras["pred_four_phase_env01"] = self.corr.to_unit(pred_four_env)
-
-        return pred_xk, pred_depth, extras
-
     # ----- from-depth training path (paper style) -----
     def forward_from_depth_train(self, gt_depth: torch.Tensor,
                                  to_unit: bool = True, use_falloff: bool = False):
@@ -561,7 +533,7 @@ class PhaseMambaNet(nn.Module):
         t_map_obs = depth_to_phase_t(gt_depth)
         xk = self.get_global_xk().to(device)          # [1,2K]
         B  = gt_depth.size(0)
-        xkB = xk.expand(B, -1)                        # ★ expand to batch
+        xkB = xk.expand(B, -1)                        # expand to batch
         I_obs_env = self.corr.sample_map_env(
             xkB, t_map_obs,
             beta=self.env_beta, kappa=self.env_kappa,
@@ -718,9 +690,20 @@ class PhaseMambaPhysLoss(nn.Module):
             zncc_val = self.zncc(pred_four, obs)
             zncc_loss = 1.0 - zncc_val
 
-            # frequency prior
+            # (optional) frequency prior on x_k
             if pred_xk is not None and self.freq_l1_w > 0:
-                freq_prior = self._freq_l1_prior(pred_xk)
+                # we reuse prior weights from freq_weights
+                xk = pred_xk.squeeze()
+                if xk.ndim == 1:
+                    xk = xk.unsqueeze(0)
+                B, D = xk.shape
+                K = self.freq_weights.numel()
+                if D == 2*K:
+                    a, s = xk[:, :K], xk[:, K:]
+                else:
+                    a, s = xk, xk.new_zeros(xk.shape)
+                w = self.freq_weights.view(1, K)
+                freq_prior = (w * (a.abs() + s.abs())).sum() / B
 
         total = (self.mae_w * mae
                  + self.ssim_w * ssim_loss
