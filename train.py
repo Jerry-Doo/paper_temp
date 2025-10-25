@@ -1,56 +1,29 @@
-# train.py — Physics-aware iToF trainer (dual-mode)
+# train.py — Physics-aware iToF trainer (From-Depth only)
 # -------------------------------------------------
-# Modes:
-#  (A) Default measured mode: train on measured 4-phase images + GT depth
-#  (B) --train_from_depth: synthesize 4-phase from GT depth IN-GRAPH (paper-style)
-#      and train end-to-end with the differentiable physics layer participating.
+# Use GT depth to synthesize 4-phase in-graph, with differentiable physics.
 #
 # Requirements:
-#   - model.py in the same directory (see the companion file placed in canvas)
-#   - pip install mamba-ssm (optional; otherwise falls back to conv backbone)
+#   - model.py (this repo's version; measured mode removed; requires mamba-ssm)
 #
-# Example (measured):
-#   python train.py --phase_dir data/phases --gt_dir data/depths --save_dir runs/measured
-# Example (paper-style from depth):
-#   python train.py --gt_dir data/depths --train_from_depth --save_dir runs/paper --export_four_phase
+# Example:
+#   python train.py --gt_dir data/depths --save_dir runs/paper --export_four_phase
 
-import os, re, argparse, random, json, math, shutil
+import os, re, argparse, random, json, shutil
 from pathlib import Path
-from typing import Optional, List, Sequence, Union, Tuple, Dict
+from typing import Optional, List, Union, Tuple
 
 import numpy as np
 from PIL import Image
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from model import (
-    PhaseMambaNet,
-    PhaseMambaPhysLoss,
-)
+from model import PhaseMambaNet, PhaseMambaPhysLoss
 
 # ---------------- I/O ----------------
-def read_gray_image(path: Union[str, Path]) -> torch.Tensor:
-    im = Image.open(path)
-    if im.mode not in ("I;16", "I", "F", "L"):
-        try:
-            im = im.convert("I;16")
-        except Exception:
-            im = im.convert("L")
-    arr = np.array(im)
-    if arr.dtype == np.uint16:
-        x = torch.from_numpy(arr.astype(np.float32)) / 65535.0
-    elif arr.dtype == np.uint32:
-        arr = arr.astype(np.float32)
-        x = torch.from_numpy(arr / max(arr.max(), 1.0))
-    else:
-        x = torch.from_numpy(arr.astype(np.float32)) / 255.0
-    return x
-
 def read_depth_image(path: Union[str, Path], depth_scale: Optional[float]) -> torch.Tensor:
     im = Image.open(path)
     arr = np.array(im)
@@ -67,94 +40,7 @@ def read_depth_image(path: Union[str, Path], depth_scale: Optional[float]) -> to
             depth = depth / float(depth_scale)
     return depth
 
-
-# --------------- Camera noise ---------------
-class CameraNoise(nn.Module):
-    def __init__(self,
-                 read_std_range: Tuple[float, float] = (0.001, 0.01),
-                 shot_k_range: Tuple[float, float]  = (0.0, 0.02),
-                 gain_range: Tuple[float, float]    = (0.95, 1.05),
-                 offset_range: Tuple[float, float]  = (-0.02, 0.02),
-                 fpn_row_range: Tuple[float, float] = (0.0, 0.005),
-                 fpn_col_range: Tuple[float, float] = (0.0, 0.005)):
-        super().__init__()
-        self.read_std_range = read_std_range
-        self.shot_k_range = shot_k_range
-        self.gain_range = gain_range
-        self.offset_range = offset_range
-        self.fpn_row_range = fpn_row_range
-        self.fpn_col_range = fpn_col_range
-
-    @staticmethod
-    def _rand(a: float, b: float) -> float:
-        return float(torch.empty(1).uniform_(a, b))
-
-    def forward(self, img4: torch.Tensor) -> torch.Tensor:
-        x = img4.clamp(0.0, 1.0)
-        H, W = x.shape[-2:]
-        device = x.device
-
-        gain = self._rand(*self.gain_range)
-        offset = self._rand(*self.offset_range)
-        y = x * gain + offset
-
-        read_std = self._rand(*self.read_std_range)
-        y = y + torch.randn_like(y) * read_std
-
-        shot_k = self._rand(*self.shot_k_range)
-        y = y + torch.randn_like(y) * torch.sqrt(torch.clamp(y, min=0.0)) * shot_k
-
-        row_amp = self._rand(*self.fpn_row_range)
-        if row_amp > 0.0:
-            y = y + torch.randn(1, H, 1, device=device) * row_amp
-        col_amp = self._rand(*self.fpn_col_range)
-        if col_amp > 0.0:
-            y = y + torch.randn(1, 1, W, device=device) * col_amp
-
-        levels = (1 << 12) - 1
-        y = torch.round(y * levels) / levels
-        return y.clamp(0.0, 1.0)
-
-
-# --------------- Datasets ---------------
-class FourPhaseDepthDataset(Dataset):
-    def __init__(self, phase_dir: Union[str, Path], gt_dir: Union[str, Path],
-                 indices: List[int], train: bool = True, depth_scale: Optional[float] = 1000.0):
-        self.phase_dir = Path(phase_dir)
-        self.gt_dir = Path(gt_dir)
-        self.indices = indices
-        self.train = train
-        self.depth_scale = depth_scale
-        self.noise = CameraNoise()
-        self.phase_tmpl = "depth_{:04d}_phase{}.png"
-        self.gt_tmpl = "depth_{:04d}.png"
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-    def __getitem__(self, i: int):
-        n = self.indices[i]
-        paths = [self.phase_dir / self.phase_tmpl.format(n, k) for k in range(4)]
-        imgs = [read_gray_image(str(p)) for p in paths]
-        four_clean = torch.stack(imgs, dim=0)  # (4,H,W) in [0,1]
-
-        gt_path = self.gt_dir / self.gt_tmpl.format(n)
-        gt_depth = read_depth_image(str(gt_path), self.depth_scale)  # (H_gt,W_gt)
-
-        H, W = four_clean.shape[-2:]
-        if gt_depth.shape[-2:] != (H, W):
-            gt_depth = F.interpolate(gt_depth.unsqueeze(0).unsqueeze(0),
-                                     size=(H, W), mode="bilinear",
-                                     align_corners=False).squeeze(0).squeeze(0)
-
-        four_input = self.noise(four_clean) if self.train else four_clean
-
-        return {
-            "four_phase": four_input.float(),            # (4,H,W) in [0,1]
-            "gt_depth": gt_depth.float().unsqueeze(0),   # (1,H,W) m
-            "index": n
-        }
-
+# --------------- Dataset (depth only) ---------------
 class DepthOnlyDataset(Dataset):
     def __init__(self, gt_dir: Union[str, Path], indices: List[int], depth_scale: Optional[float] = 1000.0):
         self.gt_dir = Path(gt_dir)
@@ -174,23 +60,7 @@ class DepthOnlyDataset(Dataset):
             "index": n
         }
 
-
 # --------------- split helpers ---------------
-def build_splits_measured(phase_dir: Union[str, Path]) -> Tuple[List[int], List[int]]:
-    phase_dir = Path(phase_dir)
-    pat = re.compile(r"depth_(\d+)_phase([0-3])\.png")
-    idxs = set()
-    for fn in os.listdir(phase_dir):
-        m = pat.match(fn)
-        if m:
-            idxs.add(int(m.group(1)))
-    idxs_s = sorted(idxs)
-    n = len(idxs_s)
-    k = int(n * 0.7) if n > 1600 else min(1000, n * 7 // 10)
-    train_idx = idxs_s[:k]
-    test_idx = idxs_s[k:]
-    return train_idx, test_idx
-
 def build_splits_depth(gt_dir: Union[str, Path]) -> Tuple[List[int], List[int]]:
     gt_dir = Path(gt_dir)
     pat = re.compile(r"depth_(\d+)\.png")
@@ -201,14 +71,13 @@ def build_splits_depth(gt_dir: Union[str, Path]) -> Tuple[List[int], List[int]]:
             idxs.append(int(m.group(1)))
     idxs_s = sorted(idxs)
     n = len(idxs_s)
-    k = int(n * 0.7)
+    k = int(n * 0.7) if n >= 10 else max(1, n * 7 // 10)
     train_idx = idxs_s[:k]
     test_idx = idxs_s[k:]
     return train_idx, test_idx
 
-
 # --------------- utils ---------------
-def param_checksum(model: nn.Module) -> float:
+def param_checksum(model) -> float:
     with torch.no_grad():
         s = 0.0
         for p in model.parameters():
@@ -261,7 +130,6 @@ def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Ten
             "note": "a/s have been L1-normalized so that Σ(|a|+|s|)=b; waveform in [0, 2*b]"
         }, fp, ensure_ascii=False, indent=2)
 
-
 def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, max_depth_vis: float = 3.0):
     out_dir.mkdir(parents=True, exist_ok=True)
     d = depth_m.detach().cpu().float().clamp(0, max_depth_vis)   # (H,W)
@@ -276,7 +144,6 @@ def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, m
     rgb = (cm(np.clip(dn, 0, 1))[:, :, :3] * 255).astype(np.uint8)
     Image.fromarray(rgb).save(out_dir / f"depth16_{index:04d}_rgb.png")
 
-
 def save_four_phase_processed(out_dir: Path, phase4: torch.Tensor, index: int,
                               prefix: str = "synth_phase", peak: float = 2.0):
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -285,21 +152,14 @@ def save_four_phase_processed(out_dir: Path, phase4: torch.Tensor, index: int,
         arr = (p[k].numpy() * 255).round().clip(0, 255).astype(np.uint8)
         Image.fromarray(arr).save(out_dir / f"{prefix}{k}_{index:04d}.png")
 
-
-def ensure_same_device(tag: str, *tensors: torch.Tensor):
-    devs = [str(t.device) for t in tensors if isinstance(t, torch.Tensor)]
-    print(f"[{tag}] devices:", devs, flush=True)
-
-
 def reset_dir(path: Path):
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
 
-
 # --------------- EMA ---------------
 class EMA:
-    def __init__(self, model: nn.Module, decay: float = 0.999):
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
         self.decay = decay
         self.shadow = {k: v.detach().clone()
                        for k, v in model.state_dict().items()
@@ -307,30 +167,27 @@ class EMA:
         self.backup = None
 
     @torch.no_grad()
-    def update(self, model: nn.Module):
+    def update(self, model: torch.nn.Module):
         for k, v in model.state_dict().items():
             if k in self.shadow and torch.is_floating_point(v):
-                self.shadow[k].mul_((self.decay)).add_(v.detach(), alpha=1 - self.decay)
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
 
-    def apply(self, model: nn.Module):
+    def apply(self, model: torch.nn.Module):
         self.backup = {k: v.detach().clone() for k, v in model.state_dict().items() if k in self.shadow}
         model.load_state_dict({**model.state_dict(), **self.shadow}, strict=False)
 
-    def restore(self, model: nn.Module):
+    def restore(self, model: torch.nn.Module):
         if self.backup is not None:
             model.load_state_dict({**model.state_dict(), **self.backup}, strict=False)
             self.backup = None
-
 
 # --------------- main ---------------
 def main():
     parser = argparse.ArgumentParser()
     # Paths
-    parser.add_argument("--phase_dir", type=str, default=None, help="Folder with 4-phase PNGs (measured mode)")
     parser.add_argument("--gt_dir", type=str, required=True, help="Folder with GT depth PNGs depth_XXXX.png")
     parser.add_argument("--depth_scale", type=float, default=1000.0, help="Divide raw depth by this if uint16/uint8")
-    # Modes
-    parser.add_argument("--train_from_depth", action="store_true", help="Paper-style: synth 4-phase from GT depth")
+    # Physics options
     parser.add_argument("--use_falloff", action="store_true", help="Enable geometric falloff (d0/z)^2 in synthesis")
     # Training
     parser.add_argument("--epochs", type=int, default=300)
@@ -383,18 +240,10 @@ def main():
     (save_dir / "expr").mkdir(parents=True, exist_ok=True)
 
     # ---------- Splits & Datasets ----------
-    if args.train_from_depth:
-        train_idx, test_idx = build_splits_depth(args.gt_dir)
-        print(f"[Mode: from_depth] Train items: {len(train_idx)}, Test items: {len(test_idx)}")
-        train_ds = DepthOnlyDataset(args.gt_dir, train_idx, depth_scale=args.depth_scale)
-        test_ds  = DepthOnlyDataset(args.gt_dir, test_idx,  depth_scale=args.depth_scale)
-    else:
-        if args.phase_dir is None:
-            raise ValueError("--phase_dir is required for measured mode")
-        train_idx, test_idx = build_splits_measured(args.phase_dir)
-        print(f"[Mode: measured] Train items: {len(train_idx)}, Test items: {len(test_idx)}")
-        train_ds = FourPhaseDepthDataset(args.phase_dir, args.gt_dir, train_idx, train=True,  depth_scale=args.depth_scale)
-        test_ds  = FourPhaseDepthDataset(args.phase_dir, args.gt_dir, test_idx,  train=False, depth_scale=args.depth_scale)
+    train_idx, test_idx = build_splits_depth(args.gt_dir)
+    print(f"[Mode: from_depth] Train items: {len(train_idx)}, Test items: {len(test_idx)}")
+    train_ds = DepthOnlyDataset(args.gt_dir, train_idx, depth_scale=args.depth_scale)
+    test_ds  = DepthOnlyDataset(args.gt_dir, test_idx,  depth_scale=args.depth_scale)
 
     pin = args.device.startswith("cuda")
     train_loader = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
@@ -402,86 +251,38 @@ def main():
     test_loader  = DataLoader(test_ds,  batch_size=args.bs, shuffle=False,
                               num_workers=args.num_workers, pin_memory=pin)
 
-    # ---------- Per-dimension bounds for x_k (K=15 -> 2K=30) ----------
+    # ---------- x_k bounds (K=15 -> 2K=30) ----------
     cos_min = torch.tensor([
-        0.0247367180319292,
-       -0.218511647188518,
-       -0.128039900641918,
-       -0.188089030029964,
-       -0.101271446313554,
-       -0.0739265690272022,
-       -0.0517185888075761,
-       -0.0470680503186579,
-       -0.0429835203719536,
-       -0.0113244401026370,
-       -0.0867256924442522,
-       -0.0398804608758447,
-       -0.0255234949605406,
-       -0.0204187959684325,
-       -0.0163350367747460
+        0.0247367180319292, -0.218511647188518, -0.128039900641918, -0.188089030029964,
+        -0.101271446313554, -0.0739265690272022, -0.0517185888075761, -0.0470680503186579,
+        -0.0429835203719536, -0.0113244401026370, -0.0867256924442522, -0.0398804608758447,
+        -0.0255234949605406, -0.0204187959684325, -0.0163350367747460
     ], dtype=torch.float32)
-
     cos_max = torch.tensor([
-        1.000000562151060,
-        0.246269657347430,
-        0.172776779981168,
-        0.067885132423475,
-        0.054348930049410,
-        0.0110355732644022,
-        0.0079027851216088,
-        0.0073635999741769,
-        0.0075220109866885,
-        0.0071864386286823,
-        0.0059862393148076,
-        0.0108529551727735,
-        0.00507913000000000,
-        0.0050842000000000,
-        0.0044896000000000
+        1.000000562151060, 0.246269657347430, 0.172776779981168, 0.067885132423475,
+        0.054348930049410, 0.0110355732644022, 0.0079027851216088, 0.0073635999741769,
+        0.0075220109866885, 0.0071864386286823, 0.0059862393148076, 0.0108529551727735,
+        0.00507913000000000, 0.0050842000000000, 0.0044896000000000
     ], dtype=torch.float32)
-
     sin_min = torch.tensor([
-       -0.292903812153803,
-       -0.133624174055044,
-       -0.0765348572830997,
-       -0.0384905669003143,
-       -0.0313234820028485,
-       -0.0303887103998798,
-       -0.0452395377084766,
-       -0.0344357506637897,
-       -0.0309456571202258,
-       -0.0212468035562158,
-       -0.0146363445052302,
-       -0.0149122298097099,
-       -0.0127050000000000,
-       -0.0108800000000000,
-       -0.0094200000000000
+        -0.292903812153803, -0.133624174055044, -0.0765348572830997, -0.0384905669003143,
+        -0.0313234820028485, -0.0303887103998798, -0.0452395377084766, -0.0344357506637897,
+        -0.0309456571202258, -0.0212468035562158, -0.0146363445052302, -0.0149122298097099,
+        -0.0127050000000000, -0.0108800000000000, -0.0094200000000000
     ], dtype=torch.float32)
-
     sin_max = torch.tensor([
-        0.305261167400373,
-        0.119887020570952,
-        0.0706313176834897,
-        0.0397174345064721,
-        0.0344136176416263,
-        0.0266434058843329,
-        0.0403971596620880,
-        0.00367550978888006,
-        0.00348480445863076,
-        0.00284442773359534,
-        0.00325240839414840,
-        0.00268676948278312,
-        0.00241000000000000,
-        0.00213000000000000,
-        0.00189000000000000
+        0.305261167400373, 0.119887020570952, 0.0706313176834897, 0.0397174345064721,
+        0.0344136176416263, 0.0266434058843329, 0.0403971596620880, 0.00367550978888006,
+        0.00348480445863076, 0.00284442773359534, 0.00325240839414840, 0.00268676948278312,
+        0.00241000000000000, 0.00213000000000000, 0.00189000000000000
     ], dtype=torch.float32)
-
     xk_min = torch.cat([cos_min, sin_min], dim=0)  # [30]
     xk_max = torch.cat([cos_max, sin_max], dim=0)  # [30]
 
     # ---------- Model ----------
     model = PhaseMambaNet(
         dim=args.dim, num_blocks=args.blocks,
-        in_ch=4,  # four-phase input channels (or synthesized in paper-mode)
+        in_ch=4,
         use_corr_synth=True,
         base_freq_hz=args.base_freq_hz,
         dmax=args.dmax,
@@ -495,7 +296,7 @@ def main():
 
     # ---------- Loss ----------
     loss_fn = PhaseMambaPhysLoss(
-        mae_w=1.0, ssim_w=0.5, zncc_w=(0.5 if not args.train_from_depth else 0.25),
+        mae_w=1.0, ssim_w=0.5, zncc_w=0.25,   # from-depth: 0.25 常用
         edge_w=args.edge_w,
         ssim_use_depth_unit=True,
         ssim_max_val=1.0,
@@ -549,40 +350,21 @@ def main():
         checksum_before = param_checksum(model)
 
         for i, batch in enumerate(pbar):
-            if args.train_from_depth:
-                gt_depth = batch["gt_depth"].to(args.device, non_blocking=True)
-                device_type = 'cuda' if args.device.startswith('cuda') else 'cpu'
-                ctx = torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp)
-                with ctx:
-                    pred_xk, pred_depth, extras = model.forward_from_depth_train(
-                        gt_depth, to_unit=True, use_falloff=args.use_falloff
-                    )
-                    # Use MAE/SSIM + ZNCC(self-consistency) between pred_four and obs (both unit)
-                    total, logs = loss_fn(
-                        pred_depth=pred_depth,
-                        gt_depth=gt_depth,
-                        pred_xk=pred_xk,
-                        obs_four_phase=extras.get("I_obs_paper_like01"),
-                        pred_four_phase_pred01=extras.get("pred_four_phase_env01")
-                    )
-                    loss = total / args.accum
-            else:
-                four_phase = batch["four_phase"].to(args.device, non_blocking=True)
-                gt_depth   = batch["gt_depth"].to(args.device, non_blocking=True)
-                if i == 0 and epoch == 1:
-                    ensure_same_device("train/before", four_phase, gt_depth, next(model.parameters()))
-                device_type = 'cuda' if args.device.startswith('cuda') else 'cpu'
-                ctx = torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp)
-                with ctx:
-                    pred_xk, pred_depth, extras = model(four_phase)
-                    total, logs = loss_fn(
-                        pred_depth=pred_depth,
-                        gt_depth=gt_depth,
-                        pred_xk=pred_xk,
-                        obs_four_phase=four_phase,
-                        pred_four_phase_pred01=extras.get("pred_four_phase_env01")
-                    )
-                    loss = total / args.accum
+            gt_depth = batch["gt_depth"].to(args.device, non_blocking=True)
+            device_type = 'cuda' if args.device.startswith('cuda') else 'cpu'
+            ctx = torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp)
+            with ctx:
+                pred_xk, pred_depth, extras = model.forward_from_depth_train(
+                    gt_depth, to_unit=True, use_falloff=args.use_falloff
+                )
+                total, logs = loss_fn(
+                    pred_depth=pred_depth,
+                    gt_depth=gt_depth,
+                    pred_xk=pred_xk,
+                    obs_four_phase=extras.get("I_obs_paper_like01"),
+                    pred_four_phase_pred01=extras.get("pred_four_phase_env01")
+                )
+                loss = total / args.accum
 
             loss.backward()
             do_step = ((i + 1) % args.accum == 0) or ((i + 1) == len(train_loader))
@@ -630,90 +412,42 @@ def main():
                 reset_dir(expr_ep_dir)
 
             for i, batch in enumerate(pbar_v):
-                if args.train_from_depth:
-                    gt_depth = batch["gt_depth"].to(args.device, non_blocking=True)
-                    pred_xk, pred_depth, extras = model.forward_from_depth_train(
-                        gt_depth, to_unit=True, use_falloff=args.use_falloff
+                gt_depth = batch["gt_depth"].to(args.device, non_blocking=True)
+                pred_xk, pred_depth, extras = model.forward_from_depth_train(
+                    gt_depth, to_unit=True, use_falloff=args.use_falloff
+                )
+                if args.tta_flip:
+                    gt_depth_flip = torch.flip(gt_depth, dims=[-1])
+                    _, pred_depth_flip, _ = model.forward_from_depth_train(
+                        gt_depth_flip, to_unit=True, use_falloff=args.use_falloff
                     )
-                    if args.tta_flip:
-                        gt_depth_flip = torch.flip(gt_depth, dims=[-1])
-                        _, pred_depth_flip, _ = model.forward_from_depth_train(
-                            gt_depth_flip, to_unit=True, use_falloff=args.use_falloff
-                        )
-                        pred_depth = 0.5 * (pred_depth + torch.flip(pred_depth_flip, dims=[-1]))
+                    pred_depth = 0.5 * (pred_depth + torch.flip(pred_depth_flip, dims=[-1]))
 
-                    total, logs = loss_fn(
-                        pred_depth=pred_depth,
-                        gt_depth=gt_depth,
-                        pred_xk=pred_xk,
-                        obs_four_phase=extras.get("I_obs_paper_like01"),
-                        pred_four_phase_pred01=extras.get("pred_four_phase_env01")
-                    )
+                total, logs = loss_fn(
+                    pred_depth=pred_depth,
+                    gt_depth=gt_depth,
+                    pred_xk=pred_xk,
+                    obs_four_phase=extras.get("I_obs_paper_like01"),
+                    pred_four_phase_pred01=extras.get("pred_four_phase_env01")
+                )
 
-                    bs = gt_depth.size(0)
-                    val_loss += float(total) * bs
-                    val_n    += bs
+                bs = gt_depth.size(0)
+                val_loss += float(total) * bs
+                val_n    += bs
 
-                    if i == 0:
-                        print("[valid stats]",
-                              "pred_depth", tensor_stats(pred_depth),
-                              "| gt_depth", tensor_stats(gt_depth))
+                if i == 0:
+                    print("[valid stats]",
+                          "pred_depth", tensor_stats(pred_depth),
+                          "| gt_depth", tensor_stats(gt_depth))
 
-                    if args.export_four_phase:
-                        for b in range(bs):
-                            idx = int(batch["index"][b])
-                            I_obs = extras.get("I_obs_paper_like01")[b]
-                            save_four_phase_processed(vis_ep_dir, I_obs, idx, prefix="obs_paper01", peak=1.0)
-                            synth4 = extras.get("pred_four_phase_env")[b] if "pred_four_phase_env" in extras else None
-                            if synth4 is not None:
-                                save_four_phase_processed(vis_ep_dir, synth4, idx, prefix="pred_phase", peak=2*args.corr_dc)
-                            save_depth_16bit_and_rgb(vis_ep_dir, pred_depth[b, 0], idx, max_depth_vis=args.max_depth_vis)
-                            save_signal_expression(expr_ep_dir, model.corr.freqs_hz, pred_xk[b].cpu(), idx,
-                                                   dc_baseline=args.corr_dc)
-                else:
-                    four_phase = batch["four_phase"].to(args.device, non_blocking=True)
-                    gt_depth   = batch["gt_depth"].to(args.device, non_blocking=True)
-
-                    pred_xk, pred_depth, extras = model(four_phase)
-
-                    if args.tta_flip:
-                        four_phase_flip = torch.flip(four_phase, dims=[-1])
-                        _, pred_depth_flip, _ = model(four_phase_flip)
-                        pred_depth = 0.5 * (pred_depth + torch.flip(pred_depth_flip, dims=[-1]))
-
-                    total, logs = loss_fn(
-                        pred_depth=pred_depth,
-                        gt_depth=gt_depth,
-                        pred_xk=pred_xk,
-                        obs_four_phase=four_phase,
-                        pred_four_phase_pred01=extras.get("pred_four_phase_env01")
-                    )
-                    bs = four_phase.size(0)
-                    val_loss += float(total) * bs
-                    val_n    += bs
-
-                    if i == 0:
-                        print("[valid stats]",
-                              "pred_depth", tensor_stats(pred_depth),
-                              "| gt_depth", tensor_stats(gt_depth))
-
-                    synth4   = extras.get("pred_four_phase", None)     # 0..2b
-                    synth401 = extras.get("pred_four_phase_env01", None)   # 0..1
-                    if args.show_four_phase_log and synth4 is not None:
-                        print(f"[valid four-phase 0..2b] min={synth4.amin().item():.4f} max={synth4.amax().item():.4f}")
-
+                if args.export_four_phase:
                     for b in range(bs):
                         idx = int(batch["index"][b])
-
-                        if args.export_four_phase and synth4 is not None:
-                            save_four_phase_processed(
-                                vis_ep_dir, synth4[b], idx, prefix="synth_phase", peak=2*args.corr_dc
-                            )
-                        if args.export_four_phase and synth401 is not None:
-                            save_four_phase_processed(
-                                vis_ep_dir, synth401[b], idx, prefix="synth_phase01", peak=1.0
-                            )
-
+                        I_obs = extras.get("I_obs_paper_like01")[b]
+                        save_four_phase_processed(vis_ep_dir, I_obs, idx, prefix="obs_paper01", peak=1.0)
+                        synth4 = extras.get("pred_four_phase_env")[b] if "pred_four_phase_env" in extras else None
+                        if synth4 is not None:
+                            save_four_phase_processed(vis_ep_dir, synth4, idx, prefix="pred_phase", peak=2*args.corr_dc)
                         save_depth_16bit_and_rgb(vis_ep_dir, pred_depth[b, 0], idx,
                                                  max_depth_vis=args.max_depth_vis)
                         save_signal_expression(expr_ep_dir, model.corr.freqs_hz, pred_xk[b].cpu(), idx,
@@ -754,7 +488,6 @@ def main():
     print("Done.",
           "Depth outputs ->", str(save_dir / "vis"),
           "| Expressions ->", str(save_dir / "expr"))
-
 
 if __name__ == "__main__":
     main()

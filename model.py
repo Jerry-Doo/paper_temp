@@ -10,18 +10,21 @@
 
 from __future__ import annotations
 import math
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------- optional mamba backbone ----------
+# --------- require mamba backbone ----------
 try:
     from mamba_ssm import Mamba  # pip install mamba-ssm
-except Exception:
-    Mamba = None
-
+except Exception as e:
+    raise ImportError(
+        "[model.py] mamba-ssm is required but not available.\n"
+        "Please install a build compatible with your PyTorch/CUDA.\n"
+        f"Original import error: {repr(e)}"
+    )
 
 # -------------------- utilities --------------------
 _SPEED_OF_LIGHT = 299_792_458.0  # m/s
@@ -230,12 +233,12 @@ class CorrelationSynthesizer(nn.Module):
     def sample_map_env(self,
                        xk: torch.Tensor,
                        t_map: torch.Tensor,
-                       beta: torch.Tensor | float = 0.0,          # ambient
-                       kappa: torch.Tensor | None = None,          # per-phase DC (4,) or (B,4,1,1)
-                       lam_d: torch.Tensor | float = 0.0,          # dark current
-                       gain: torch.Tensor | float = 1.0,           # readout/exposure gain
-                       alpha: torch.Tensor | float | None = None,  # reflectance (optional)
-                       use_falloff: bool = False, d0: float = 1.0, # geometric falloff (optional)
+                       beta: Union[torch.Tensor, float] = 0.0,          # ambient
+                       kappa: Optional[torch.Tensor] = None,            # per-phase DC (4,) or (B,4,1,1)
+                       lam_d: Union[torch.Tensor, float] = 0.0,         # dark current
+                       gain: Union[torch.Tensor, float] = 1.0,          # readout/exposure gain
+                       alpha: Optional[Union[torch.Tensor, float]] = None,  # reflectance
+                       use_falloff: bool = False, d0: float = 1.0,      # geometric falloff
                        for_zncc: bool = False) -> torch.Tensor:
         """
         out = gain * ( alpha*falloff*y_signal + beta*kappa + lam_d )
@@ -299,8 +302,6 @@ class MambaBlock2D(nn.Module):
     """Wrap mamba-ssm.Mamba for 2D features (flatten HW as sequence)."""
     def __init__(self, dim: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
-        if Mamba is None:
-            raise ImportError("mamba-ssm not found. Please: pip install mamba-ssm")
         self.norm = nn.LayerNorm(dim)
         self.mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
         self.ffn = nn.Sequential(
@@ -319,20 +320,9 @@ class MambaBlock2D(nn.Module):
         return y
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, ch: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(ch, ch, 3, padding=1), nn.GELU(),
-            nn.Conv2d(ch, ch, 3, padding=1), nn.GELU()
-        )
-    def forward(self, x): return self.net(x)
-
-
 class Backbone(nn.Module):
     """
-    PatchEmbed -> N blocks -> Upsample -> heads
-    If mamba-ssm is available, uses Mamba blocks; otherwise conv blocks.
+    PatchEmbed -> N Mamba blocks -> Upsample -> heads
     """
     def __init__(self, in_ch: int = 4, dim: int = 128, num_blocks: int = 8, scale: int = 4, k: int = 30):
         super().__init__()
@@ -343,10 +333,8 @@ class Backbone(nn.Module):
             nn.Conv2d(dim, dim, kernel_size=3, padding=1),
             nn.GELU(),
         )
-        if Mamba is not None:
-            blocks = [MambaBlock2D(dim) for _ in range(num_blocks)]
-        else:
-            blocks = [ConvBlock(dim) for _ in range(num_blocks)]
+        blocks = [MambaBlock2D(dim) for _ in range(num_blocks)]
+        print(f"[Backbone] Using Mamba blocks (num={num_blocks})")
         self.blocks = nn.Sequential(*blocks)
         self.upsample = nn.Sequential(
             nn.Upsample(scale_factor=scale, mode='bilinear', align_corners=False),
@@ -692,7 +680,6 @@ class PhaseMambaPhysLoss(nn.Module):
 
             # (optional) frequency prior on x_k
             if pred_xk is not None and self.freq_l1_w > 0:
-                # we reuse prior weights from freq_weights
                 xk = pred_xk.squeeze()
                 if xk.ndim == 1:
                     xk = xk.unsqueeze(0)
