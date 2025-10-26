@@ -1,12 +1,11 @@
 # train.py — Physics-aware iToF trainer (From-Depth only)
 # -------------------------------------------------
-# 用 GT 深度在图中合成 4 相位观测；网络从 4 相位回归深度，并用 ZNCC 做自一致约束。
+# Use GT depth to synthesize 4-phase in-graph, with differentiable physics.
 #
-# 示例：
-#   python train.py \
-#     --gt_dir ./nyu_output/depths \
-#     --save_dir runs/paper \
-#     --use_falloff --zncc_w 0.25 --dim 128 --blocks 8 --amp --ema
+# Example:
+#   python train.py --gt_dir data/depths --save_dir runs/paper \
+#     --export_four_phase --zncc_w 0.25 --dim 128 --blocks 8 --amp --ema
+#   # 可选排障：--no_noise  或  --freeze_wave_epochs 3
 
 import os, re, argparse, random, json, shutil
 from pathlib import Path
@@ -86,19 +85,14 @@ def param_checksum(model) -> float:
         return s
 
 def tensor_stats(x: torch.Tensor) -> str:
-    x = torch.nan_to_num(x.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    x = x.detach().float()
     return f"min={float(x.min()):.4f} mean={float(x.mean()):.4f} max={float(x.max()):.4f}"
-
-def _to_list_safe(t: torch.Tensor) -> List[float]:
-    t = torch.nan_to_num(t.detach().cpu().float(), nan=0.0, posinf=0.0, neginf=0.0)
-    return [float(v) for v in t.view(-1)]
 
 def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Tensor,
                            index: int, dc_baseline: float = 1.0):
     expr_dir.mkdir(parents=True, exist_ok=True)
-    freqs = _to_list_safe(freqs_hz)
-
-    xk = torch.nan_to_num(xk.detach().cpu().squeeze().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    freqs = freqs_hz.detach().cpu().numpy().tolist()
+    xk = xk.detach().cpu().squeeze().float()
     K = len(freqs)
     if xk.numel() == 2 * K:
         a = xk[:K]; s = xk[K:]
@@ -106,11 +100,10 @@ def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Ten
         a = xk; s = torch.zeros_like(a)
     else:
         raise ValueError(f"xk length {xk.numel()} not in {{K,2K}} where K={K}")
-
     l1 = (a.abs() + s.abs()).sum().clamp(min=1e-12)
-    scale = float(dc_baseline) / float(l1)
-    a_n = _to_list_safe(a * scale)
-    s_n = _to_list_safe(s * scale)
+    scale = dc_baseline / l1
+    a_n = (a * scale).numpy().tolist()
+    s_n = (s * scale).numpy().tolist()
     b = float(dc_baseline)
 
     expr = [
@@ -129,18 +122,16 @@ def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Ten
             "s_coeffs_l1norm": s_n,
             "freqs_hz": freqs,
             "dc_baseline": b,
-            "note": "a/s 已按 L1 归一化使 Σ(|a|+|s|)=b；合成 4 相位范围在 [0, 2*b]"
+            "note": "a/s have been L1-normalized so that Σ(|a|+|s|)=b; waveform in [0, 2*b]"
         }, fp, ensure_ascii=False, indent=2)
 
 def _sanitize_img(x: torch.Tensor, peak: float) -> torch.Tensor:
-    # 防止 NaN/Inf 导致保存报错
     x = torch.nan_to_num(x, nan=0.0, posinf=peak, neginf=0.0)
     return x.clamp(0, peak) / peak
 
 def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, max_depth_vis: float = 3.0):
     out_dir.mkdir(parents=True, exist_ok=True)
-    d = torch.nan_to_num(depth_m.detach().cpu().float(), nan=0.0, posinf=0.0, neginf=0.0)
-    d = d.clamp(0, max_depth_vis)                       # (H,W)
+    d = depth_m.detach().cpu().float().clamp(0, max_depth_vis)   # (H,W)
     d16 = (d / max_depth_vis * 65535.0).round().clamp(0, 65535).to(torch.uint16).numpy()
     Image.fromarray(d16).save(out_dir / f"depth16_{index:04d}.png")
 
@@ -208,10 +199,10 @@ def main():
     parser.add_argument("--save_dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action="store_true", help="Use AMP (bfloat16)")
-    parser.add_argument("--max_depth_vis", type=float, default=6.0)
+    parser.add_argument("--max_depth_vis", type=float, default=10.0)
     parser.add_argument("--dim", type=int, default=96)
     parser.add_argument("--blocks", type=int, default=6)
-    parser.add_argument("--dmax", type=float, default=8.0, help="Depth range upper bound for head mapping")
+    parser.add_argument("--dmax", type=float, default=10.0, help="Depth range upper bound for head mapping")
     parser.add_argument("--base_freq_hz", type=float, default=50e6)
     # Scheduler
     parser.add_argument("--patience", type=int, default=10)
@@ -237,11 +228,15 @@ def main():
     parser.add_argument("--freq_alpha", type=float, default=1.0)
     # 可选项：ZNCC 权重（from-depth 推荐 0.25）
     parser.add_argument("--zncc_w", type=float, default=0.25)
-    # 兼容旗标：忽略但不报错，便于你继续用旧命令
+    # 可选：早期冻结波形，避免发散
+    parser.add_argument("--freeze_wave_epochs", type=int, default=0)
+    # 可选：禁用合成噪声，用于排障
+    parser.add_argument("--no_noise", action="store_true")
+    # 兼容旗标（忽略）
     parser.add_argument("--train_from_depth", action="store_true",
-                        help="(ignored) compatibility flag; from-depth is the only mode.")
-    args = parser.parse_args()
+                        help="(ignored) From-depth is the only mode.")
 
+    args = parser.parse_args()
     if args.train_from_depth:
         print("[Note] --train_from_depth is ignored (from-depth is the only mode).")
 
@@ -310,6 +305,16 @@ def main():
         xk_min=xk_min, xk_max=xk_max,
     ).to(args.device)
 
+    # 关闭噪声（排障选项）
+    if args.no_noise:
+        model._noise_read = (0.0, 0.0)
+        model._noise_shot = (0.0, 0.0)
+        model._noise_gain = (1.0, 1.0)
+        model._noise_offs = (0.0, 0.0)
+        model._noise_fpnr = (0.0, 0.0)
+        model._noise_fpnc = (0.0, 0.0)
+        print("[Info] Paper-like sensor noise is DISABLED (--no_noise).")
+
     # ---------- Loss ----------
     loss_fn = PhaseMambaPhysLoss(
         mae_w=1.0, ssim_w=0.5, zncc_w=args.zncc_w,
@@ -360,6 +365,16 @@ def main():
         return True
 
     for epoch in range(1, args.epochs + 1):
+        # 冻结波形参数（可选）
+        freeze_wave = epoch <= max(0, args.freeze_wave_epochs)
+        for g in optimizer.param_groups:
+            if "params" in g and len(g["params"]) > 0:
+                pass
+        if freeze_wave and len(wave_params) > 0:
+            for p in wave_params: p.requires_grad_(False)
+        else:
+            for p in wave_params: p.requires_grad_(True)
+
         # -------- Train --------
         model.train()
         if epoch <= args.warmup_epochs:
@@ -398,7 +413,10 @@ def main():
                 if args.clip_grad and args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.step()
-                if hasattr(model, "clamp_env_"):
+                # >>> 关键：step 后立刻清洗+约束，避免 NaN 继续扩散
+                if hasattr(model, "sanitize_"):
+                    model.sanitize_()
+                elif hasattr(model, "clamp_env_"):
                     model.clamp_env_()
                 if use_ema:
                     ema.update(model)
@@ -415,7 +433,9 @@ def main():
                 })
 
         checksum_after = param_checksum(model)
-        print(f"[epoch {epoch}] param_delta={(checksum_after - checksum_before):.4e}")
+        print(f"[epoch {epoch}] param_delta={(checksum_after - checksum_before):.4e}  "
+              f"env(gain={float(model.env_gain.detach()):.3f}, beta={float(model.env_beta.detach()):.3f}, "
+              f"lam_d={float(model.env_lam_d.detach()):.3f})")
 
         # -------- Validate --------
         model.eval()
@@ -473,9 +493,9 @@ def main():
                         idx = int(batch["index"][b])
                         I_obs = extras.get("I_obs_paper_like01")[b]
                         save_four_phase_processed(vis_ep_dir, I_obs, idx, prefix="obs_paper01", peak=1.0)
-                        synth4 = extras.get("pred_four_phase_env")[b] if "pred_four_phase_env" in extras else None
-                        if synth4 is not None:
-                            save_four_phase_processed(vis_ep_dir, synth4, idx, prefix="pred_phase", peak=2*args.corr_dc)
+                        #synth4 = extras.get("pred_four_phase_env")[b] if "pred_four_phase_env" in extras else None
+                        #if synth4 is not None:
+                        #    save_four_phase_processed(vis_ep_dir, synth4, idx, prefix="pred_phase", peak=2*args.corr_dc)
                         save_depth_16bit_and_rgb(vis_ep_dir, pred_depth[b, 0], idx,
                                                  max_depth_vis=args.max_depth_vis)
                         save_signal_expression(expr_ep_dir, model.corr.freqs_hz, pred_xk[b].cpu(), idx,
@@ -512,6 +532,9 @@ def main():
                 state = torch.load(best_ckpt, map_location=args.device)
                 model.load_state_dict(state["model"])
                 print(f"[plateau] LRs reduced {prev_lr0:.2e}->{new_lr0:.2e} (base), {prev_lr1:.2e}->{new_lr1:.2e} (wave); rewind to best (epoch {state.get('epoch','?')})")
+        # 额外安全：每轮结束再清洗一次
+        if hasattr(model, "sanitize_"):
+            model.sanitize_()
 
     print("Done.",
           "Depth outputs ->", str(save_dir / "vis"),
