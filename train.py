@@ -2,11 +2,9 @@
 # -------------------------------------------------
 # Use GT depth to synthesize 4-phase in-graph, with differentiable physics.
 #
-# Requirements:
-#   - model.py (this repo's version; measured mode removed; requires mamba-ssm)
-#
 # Example:
 #   python train.py --gt_dir data/depths --save_dir runs/paper --export_four_phase
+#   # 可选：--use_falloff --zncc_w 0.25 --dim 128 --blocks 8 --amp --ema
 
 import os, re, argparse, random, json, shutil
 from pathlib import Path
@@ -97,11 +95,9 @@ def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Ten
     xk = xk.detach().cpu().squeeze().float()
     K = len(freqs)
     if xk.numel() == 2 * K:
-        a = xk[:K]
-        s = xk[K:]
+        a = xk[:K]; s = xk[K:]
     elif xk.numel() == K:
-        a = xk
-        s = torch.zeros_like(a)
+        a = xk; s = torch.zeros_like(a)
     else:
         raise ValueError(f"xk length {xk.numel()} not in {{K,2K}} where K={K}")
 
@@ -130,6 +126,11 @@ def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Ten
             "note": "a/s have been L1-normalized so that Σ(|a|+|s|)=b; waveform in [0, 2*b]"
         }, fp, ensure_ascii=False, indent=2)
 
+def _sanitize_img(x: torch.Tensor, peak: float) -> torch.Tensor:
+    # 防止 NaN/Inf 导致保存时报 warning / 崩溃
+    x = torch.nan_to_num(x, nan=0.0, posinf=peak, neginf=0.0)
+    return x.clamp(0, peak) / peak
+
 def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, max_depth_vis: float = 3.0):
     out_dir.mkdir(parents=True, exist_ok=True)
     d = depth_m.detach().cpu().float().clamp(0, max_depth_vis)   # (H,W)
@@ -147,7 +148,7 @@ def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, m
 def save_four_phase_processed(out_dir: Path, phase4: torch.Tensor, index: int,
                               prefix: str = "synth_phase", peak: float = 2.0):
     out_dir.mkdir(parents=True, exist_ok=True)
-    p = phase4.detach().cpu().float().clamp(0, peak) / peak
+    p = _sanitize_img(phase4.detach().cpu().float(), peak)
     for k in range(4):
         arr = (p[k].numpy() * 255).round().clip(0, 255).astype(np.uint8)
         Image.fromarray(arr).save(out_dir / f"{prefix}{k}_{index:04d}.png")
@@ -227,7 +228,18 @@ def main():
     parser.add_argument("--corr_norm_mode", type=str, default="none", choices=["none","fixmean","fixl2"])
     parser.add_argument("--freq_l1_w", type=float, default=0.0, help="frequency-weighted L1 prior (0=off)")
     parser.add_argument("--freq_alpha", type=float, default=1.0)
+
+    # 可选项：ZNCC 权重（from-depth 推荐 0.25）
+    parser.add_argument("--zncc_w", type=float, default=0.25)
+
+    # 兼容旗标：忽略但不报错，便于你继续用旧命令
+    parser.add_argument("--train_from_depth", action="store_true",
+                        help="(ignored) compatibility flag; from-depth is the only mode.")
+
     args = parser.parse_args()
+
+    if args.train_from_depth:
+        print("[Note] --train_from_depth is ignored (from-depth is the only mode).")
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         print("[WARN] CUDA requested but not available; falling back to CPU.")
@@ -247,9 +259,9 @@ def main():
 
     pin = args.device.startswith("cuda")
     train_loader = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=pin)
+                              num_workers=args.num_workers, pin_memory=pin, persistent_workers=False)
     test_loader  = DataLoader(test_ds,  batch_size=args.bs, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=pin)
+                              num_workers=args.num_workers, pin_memory=pin, persistent_workers=False)
 
     # ---------- x_k bounds (K=15 -> 2K=30) ----------
     cos_min = torch.tensor([
@@ -296,7 +308,7 @@ def main():
 
     # ---------- Loss ----------
     loss_fn = PhaseMambaPhysLoss(
-        mae_w=1.0, ssim_w=0.5, zncc_w=0.25,   # from-depth: 0.25 常用
+        mae_w=1.0, ssim_w=0.5, zncc_w=args.zncc_w,   # <- 可选项
         edge_w=args.edge_w,
         ssim_use_depth_unit=True,
         ssim_max_val=1.0,
@@ -337,6 +349,12 @@ def main():
     base_lr = args.lr
     wave_lr = args.lr_wave
 
+    def _finite_or_skip(total_loss, batch_dbg: str) -> bool:
+        if not torch.isfinite(total_loss):
+            print(f"[skip batch] non-finite loss at {batch_dbg}")
+            return False
+        return True
+
     for epoch in range(1, args.epochs + 1):
         # -------- Train --------
         model.train()
@@ -366,12 +384,18 @@ def main():
                 )
                 loss = total / args.accum
 
+            if not _finite_or_skip(total, f"epoch {epoch} iter {i}"):
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             loss.backward()
             do_step = ((i + 1) % args.accum == 0) or ((i + 1) == len(train_loader))
             if do_step:
                 if args.clip_grad and args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.step()
+                if hasattr(model, "clamp_env_"):
+                    model.clamp_env_()
                 if use_ema:
                     ema.update(model)
                 optimizer.zero_grad(set_to_none=True)
