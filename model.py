@@ -1,11 +1,11 @@
 # model.py
 # ============================================================
-# Physics-aware iToF network with differentiable correlation (From-Depth only)
-# - Global shared waveform x_k (cos+sin; post_box bounds)
+# Physics-aware iToF network (From-Depth only)
+# - Global waveform x_k (cos+sin; post_box bounds)
 # - Differentiable 4-phase synthesis (+ optional environment)
-# - From-Depth training path with built-in paper-like sensor noise
-# - Loss helper class: MAE + SSIM + ZNCC (+ optional frequency prior)
-# - NOTE: Measured mode has been removed. Use forward_from_depth_train().
+# - From-Depth training path with paper-like sensor noise
+# - Loss helper: MAE + SSIM + ZNCC (+ optional frequency prior)
+# NOTE: Measured mode has been removed. Use forward_from_depth_train().
 # ============================================================
 
 from __future__ import annotations
@@ -65,8 +65,7 @@ def ssim(img1: torch.Tensor, img2: torch.Tensor, max_val: float = 1.0,
     C2 = (0.03 * max_val) ** 2
     num = (2 * mu1_mu2 + C1) * (2 * sig12 + C2)
     den = (mu1_sq + mu2_sq + C1) * (sig1_sq + sig2_sq + C2)
-    out = (num / (den + 1e-8))
-    return torch.nan_to_num(out).clamp(0.0, 1.0).mean()
+    return (num / (den + 1e-8)).clamp(0.0, 1.0).mean()
 
 
 # -------------------- correlation synthesizer --------------------
@@ -81,7 +80,7 @@ class CorrelationSynthesizer(nn.Module):
                  target_mean: float = 1.0,
                  target_l2: float = 1.0,
                  dc_baseline: float = 1.0,
-                 enforce_l1_to_dc: bool = False,
+                 enforce_l1_to_dc: bool = True,      # <- 默认开启，保证初始波形有幅度
                  use_soft_clip: bool = True,
                  soft_clip_temp: float = 6.0):
         super().__init__()
@@ -143,21 +142,18 @@ class CorrelationSynthesizer(nn.Module):
 
         mode = self.normalize_mode
         if mode == "none":
-            out = y
-        elif mode == "fixmean":
+            return y
+        if mode == "fixmean":
             mu = y.mean(dim=dim, keepdim=True).clamp_min(1e-12)
-            out = y * (self.target_mean / mu)
-        elif mode == "fixl2":
+            return y * (self.target_mean / mu)
+        if mode == "fixl2":
             E = y.pow(2).sum(dim=dim, keepdim=True).clamp_min(1e-12)
-            out = y * (self.target_l2 / E).sqrt()
-        else:
-            raise ValueError(f"bad normalize_mode={mode}")
-
-        return torch.nan_to_num(out).clamp(0.0, 2.0 * b)
+            return y * (self.target_l2 / E).sqrt()
+        raise ValueError(f"bad normalize_mode={mode}")
 
     def to_unit(self, y: torch.Tensor) -> torch.Tensor:
         """Map 0..2b -> 0..1."""
-        return torch.nan_to_num(y / (2.0 * self.dc_baseline)).clamp(0.0, 1.0)
+        return (y / (2.0 * self.dc_baseline)).clamp(0.0, 1.0)
 
     # ----- continuous sampling -----
     def sample_continuous(self, xk: torch.Tensor, t_values: torch.Tensor,
@@ -183,7 +179,7 @@ class CorrelationSynthesizer(nn.Module):
         basis_c = torch.cos(omega * t + ph)  # [B,K,T]
         basis_s = torch.sin(omega * t + ph)  # [B,K,T]
         y = self.dc_baseline + (a.unsqueeze(-1) * basis_c + s.unsqueeze(-1) * basis_s).sum(dim=1)  # [B,T]
-        return torch.nan_to_num(self._postprocess(y, dim=-1, for_zncc=for_zncc))
+        return self._postprocess(y, dim=-1, for_zncc=for_zncc)
 
     # ----- 4-phase per-pixel sampling (signal-only) -----
     def sample_map(self, xk: torch.Tensor, t_map: torch.Tensor, for_zncc: bool = False) -> torch.Tensor:
@@ -231,7 +227,7 @@ class CorrelationSynthesizer(nn.Module):
         basis_s = torch.sin(w * t + ph)                 # (B,K,4,H,W)
         y = self.dc_baseline + (a.view(B, K, 1, 1, 1) * basis_c
                                 + s.view(B, K, 1, 1, 1) * basis_s).sum(dim=1)  # (B,4,H,W)
-        return torch.nan_to_num(self._postprocess(y, dim=1, for_zncc=for_zncc))
+        return self._postprocess(y, dim=1, for_zncc=for_zncc)
 
     # ----- 4-phase with environment -----
     def sample_map_env(self,
@@ -298,7 +294,7 @@ class CorrelationSynthesizer(nn.Module):
 
         pre = (alpha * falloff) * y_signal + beta * kappa + lam_d   # (B,4,H,W)
         out = gain * pre
-        return torch.nan_to_num(out)
+        return out
 
 
 # -------------------- backbones --------------------
@@ -318,15 +314,8 @@ class MambaBlock2D(nn.Module):
         B, C, H, W = x.shape
         y = x.permute(0, 2, 3, 1).reshape(B, H * W, C)  # (B,L,C)
         y = self.norm(y)
-
-        y_m = self.mamba(y)
-        y_m = torch.nan_to_num(y_m, 0.0, 0.0, 0.0).clamp_(-1e4, 1e4)
-        y = y + 0.5 * y_m  # residual scaling for stability
-
-        y_f = self.ffn(y)
-        y_f = torch.nan_to_num(y_f, 0.0, 0.0, 0.0).clamp_(-1e4, 1e4)
-        y = y + 0.5 * y_f  # residual scaling for stability
-
+        y = self.mamba(y) + y
+        y = self.ffn(y) + y
         y = y.reshape(B, H, W, C).permute(0, 3, 1, 2)
         return y
 
@@ -367,9 +356,7 @@ class Backbone(nn.Module):
         feat_l = self.blocks(feat_l)
         feat = self.upsample(feat_l)
         depth_raw = self.depth_head(feat)                 # (B,1,H,W)
-        depth_raw = torch.nan_to_num(depth_raw, 0.0, 0.0, 0.0).clamp_(-10.0, 10.0)
         xk_raw = self.xk_head(self.gap(feat)).flatten(1)  # (B,K) (not used when global)
-        xk_raw = torch.nan_to_num(xk_raw, 0.0, 0.0, 0.0).clamp_(-1e4, 1e4)
         return feat, depth_raw, xk_raw
 
 
@@ -387,7 +374,7 @@ class PhaseMambaNet(nn.Module):
                  corr_target_mean: float = 1.0,
                  corr_target_l2: float = 1.0,
                  corr_dc_baseline: float = 1.0,
-                 corr_enforce_l1_to_dc: bool = False,
+                 corr_enforce_l1_to_dc: bool = True,      # <- 默认 True
                  corr_use_soft_clip: bool = True,
                  corr_soft_clip_temp: float = 6.0,
                  # global waveform
@@ -414,7 +401,7 @@ class PhaseMambaNet(nn.Module):
             target_mean=corr_target_mean,
             target_l2=corr_target_l2,
             dc_baseline=corr_dc_baseline,
-            enforce_l1_to_dc=corr_enforce_l1_to_dc,
+            enforce_l1_to_dc=corr_enforce_l1_to_dc,   # <- 默认启用
             use_soft_clip=corr_use_soft_clip,
             soft_clip_temp=corr_soft_clip_temp,
         )
@@ -448,14 +435,17 @@ class PhaseMambaNet(nn.Module):
                 rng = (self.xk_max - self.xk_min).clamp_min(1e-6)
                 init = (mid - self.xk_min) / rng
                 self.global_xk_logits.copy_(torch.log(init / (1 - init)).squeeze())
+                # 轻微噪声打破对称，避免初始 4-phase 过于平坦
+                self.global_xk_logits.add_(0.01 * torch.randn_like(self.global_xk_logits))
         else:
             raise ValueError("xk_param_mode must be 'built_in_l1' or 'post_box'")
 
-        # learnable environment (global) -> reparameterized (softplus)
-        self.env_beta_p  = nn.Parameter(torch.tensor(0.0))
-        self.env_lam_d_p = nn.Parameter(torch.tensor(-4.0))
-        self.env_gain_p  = nn.Parameter(torch.tensor(0.0))
-        self.env_kappa_p = nn.Parameter(torch.zeros(4))
+        # learnable environment (global)
+        self.learn_env = True
+        self.env_beta  = nn.Parameter(torch.tensor(0.0))
+        self.env_lam_d = nn.Parameter(torch.tensor(0.0))
+        self.env_gain  = nn.Parameter(torch.tensor(1.0))
+        self.env_kappa = nn.Parameter(torch.ones(4))
 
         # built-in "paper-like" sensor noise (only used in from-depth train path)
         self._noise_read = (0.001, 0.01)
@@ -468,19 +458,6 @@ class PhaseMambaNet(nn.Module):
     # ----- measured mode: removed -----
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Measured mode has been removed. Use forward_from_depth_train(gt_depth, ...).")
-
-    # ----- environment parameterization (stable) -----
-    def _env_params(self):
-        gain  = F.softplus(self.env_gain_p)  + 1e-3
-        beta  = F.softplus(self.env_beta_p)
-        lam_d = F.softplus(self.env_lam_d_p)
-        kappa = F.softplus(self.env_kappa_p) + 1e-3
-
-        gain  = gain.clamp(0.5, 2.0)
-        beta  = beta.clamp(0.0, 1.0)
-        lam_d = lam_d.clamp(0.0, 0.05)
-        kappa = kappa.clamp(0.5, 1.5)
-        return gain, beta, lam_d, kappa
 
     # ----- helper: paper-like noise -----
     def paper_noise(self, img4: torch.Tensor) -> torch.Tensor:
@@ -501,7 +478,7 @@ class PhaseMambaNet(nn.Module):
         y = y + torch.randn_like(y) * read_std
 
         shot_k = _rand(*self._noise_shot)
-        y = y + torch.randn_like(y) * torch.sqrt(torch.clamp(y, min=0.0)) * shot_k
+        y = y + torch.randn_like(y) * torch.sqrt(torch.clamp(torch.abs(y), min=0.0)) * shot_k
 
         row_amp = _rand(*self._noise_fpnr)
         if row_amp > 0.0:
@@ -513,6 +490,14 @@ class PhaseMambaNet(nn.Module):
         levels = (1 << 12) - 1
         y = torch.round(y * levels) / levels
         return y.clamp(0.0, 1.0)
+
+    # ----- (optional) clamp env params for stability -----
+    def clamp_env_(self):
+        with torch.no_grad():
+            self.env_gain.clamp_(0.5, 2.0)
+            self.env_beta.clamp_(0.0, 0.5)
+            self.env_lam_d.clamp_(0.0, 0.2)
+            self.env_kappa.data.clamp_(0.5, 2.0)
 
     # ----- waveform parameterization -----
     def _xk_from_built_in_l1(self) -> torch.Tensor:
@@ -537,7 +522,7 @@ class PhaseMambaNet(nn.Module):
         """
         1) use GT depth -> synth I_obs (env) -> add paper-like noise (train only)
         2) backbone(I_obs) -> pred_depth
-        3) pred_depth -> synth pred_four_env (for zncc consistency)
+        3) pred_depth -> synth pred_four_env (for zncc self-consistency)
         """
         device = next(self.parameters()).device
         gt_depth = gt_depth.to(device)
@@ -547,38 +532,32 @@ class PhaseMambaNet(nn.Module):
         xk = self.get_global_xk().to(device)          # [1,2K]
         B  = gt_depth.size(0)
         xkB = xk.expand(B, -1)                        # expand to batch
-
-        gain, beta, lam_d, kappa = self._env_params()
         I_obs_env = self.corr.sample_map_env(
             xkB, t_map_obs,
-            beta=beta, kappa=kappa,
-            lam_d=lam_d, gain=gain,
+            beta=self.env_beta, kappa=self.env_kappa,
+            lam_d=self.env_lam_d, gain=self.env_gain,
             alpha=None, use_falloff=use_falloff, for_zncc=True
         )
-        I_obs_env = torch.nan_to_num(I_obs_env)
         I_obs01 = self.corr.to_unit(I_obs_env) if to_unit else I_obs_env
         if self.training:
             I_obs01 = self.paper_noise(I_obs01)
-        I_obs01 = I_obs01.clamp(0.0, 1.0)
 
         # (2) predict depth
         _, depth_raw, _ = self.backbone(I_obs01)
         pred_depth = (torch.tanh(depth_raw) * 0.5 + 0.5) * self.dmax
-        pred_depth = torch.nan_to_num(pred_depth, 0.0, 0.0, 0.0).clamp(0.0, self.dmax)
 
         # (3) synth from predicted depth for self-consistency
         t_map_pred = depth_to_phase_t(pred_depth)
-        gain, beta, lam_d, kappa = self._env_params()
         pred_four_env = self.corr.sample_map_env(
             xkB, t_map_pred,
-            beta=beta, kappa=kappa,
-            lam_d=lam_d, gain=gain,
+            beta=self.env_beta, kappa=self.env_kappa,
+            lam_d=self.env_lam_d, gain=self.env_gain,
             alpha=None, use_falloff=use_falloff, for_zncc=True
         )
-        pred_four_env = torch.nan_to_num(pred_four_env)
 
         extras = {
-            "I_obs_paper_like01": I_obs01,
+            # 观测用于 ZNCC 时不回传梯度，避免梯度在两条路径互相抵消/发散
+            "I_obs_paper_like01": I_obs01.detach(),
             "pred_four_phase_env":  pred_four_env,
             "pred_four_phase_env01": self.corr.to_unit(pred_four_env),
         }
@@ -602,7 +581,7 @@ class PhaseMambaPhysLoss(nn.Module):
                  corr_target_mean: float = 1.0,
                  corr_target_l2: float = 1.0,
                  corr_dc_baseline: float = 1.0,
-                 corr_enforce_l1_to_dc: bool = False,
+                 corr_enforce_l1_to_dc: bool = True,
                  corr_use_soft_clip: bool = True,
                  corr_soft_clip_temp: float = 6.0,
                  # frequency prior
@@ -649,7 +628,7 @@ class PhaseMambaPhysLoss(nn.Module):
         a_std = a.std(dim=1, keepdim=True) + eps
         b_std = b.std(dim=1, keepdim=True) + eps
         corr = ((a * b).sum(dim=1) / (a_std * b_std)).clamp(-1, 1)
-        return torch.nan_to_num(corr).mean()
+        return corr.mean()
 
     def _freq_l1_prior(self, xk: torch.Tensor) -> torch.Tensor:
         if self.freq_l1_w <= 0:
@@ -671,8 +650,8 @@ class PhaseMambaPhysLoss(nn.Module):
                 pred_depth: torch.Tensor,                 # (B,1,H,W)
                 gt_depth: torch.Tensor,                   # (B,1,H,W)
                 pred_xk: Optional[torch.Tensor] = None,
-                obs_four_phase: Optional[torch.Tensor] = None,       # (B,4,H,W) or 0..1
-                pred_four_phase_pred01: Optional[torch.Tensor] = None # (B,4,H,W) 0..1
+                obs_four_phase: Optional[torch.Tensor] = None,       # (B,4,H,W) in 0..1
+                pred_four_phase_pred01: Optional[torch.Tensor] = None # (B,4,H,W) in 0..1
                 ):
         device = pred_depth.device
         gt_depth = gt_depth.to(device)

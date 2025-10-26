@@ -1,10 +1,12 @@
 # train.py — Physics-aware iToF trainer (From-Depth only)
 # -------------------------------------------------
-# Use GT depth to synthesize 4-phase in-graph, with differentiable physics.
+# 用 GT 深度在图中合成 4 相位观测；网络从 4 相位回归深度，并用 ZNCC 做自一致约束。
 #
-# Example:
-#   python train.py --gt_dir data/depths --save_dir runs/paper --export_four_phase
-#   # 可选：--use_falloff --zncc_w 0.25 --dim 128 --blocks 8 --amp --ema
+# 示例：
+#   python train.py \
+#     --gt_dir ./nyu_output/depths \
+#     --save_dir runs/paper \
+#     --use_falloff --zncc_w 0.25 --dim 128 --blocks 8 --amp --ema
 
 import os, re, argparse, random, json, shutil
 from pathlib import Path
@@ -84,15 +86,19 @@ def param_checksum(model) -> float:
         return s
 
 def tensor_stats(x: torch.Tensor) -> str:
-    x = x.detach().float()
+    x = torch.nan_to_num(x.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
     return f"min={float(x.min()):.4f} mean={float(x.mean()):.4f} max={float(x.max()):.4f}"
+
+def _to_list_safe(t: torch.Tensor) -> List[float]:
+    t = torch.nan_to_num(t.detach().cpu().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    return [float(v) for v in t.view(-1)]
 
 def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Tensor,
                            index: int, dc_baseline: float = 1.0):
     expr_dir.mkdir(parents=True, exist_ok=True)
-    freqs = freqs_hz.detach().cpu().numpy().tolist()
+    freqs = _to_list_safe(freqs_hz)
 
-    xk = xk.detach().cpu().squeeze().float()
+    xk = torch.nan_to_num(xk.detach().cpu().squeeze().float(), nan=0.0, posinf=0.0, neginf=0.0)
     K = len(freqs)
     if xk.numel() == 2 * K:
         a = xk[:K]; s = xk[K:]
@@ -102,9 +108,9 @@ def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Ten
         raise ValueError(f"xk length {xk.numel()} not in {{K,2K}} where K={K}")
 
     l1 = (a.abs() + s.abs()).sum().clamp(min=1e-12)
-    scale = dc_baseline / l1
-    a_n = (a * scale).numpy().tolist()
-    s_n = (s * scale).numpy().tolist()
+    scale = float(dc_baseline) / float(l1)
+    a_n = _to_list_safe(a * scale)
+    s_n = _to_list_safe(s * scale)
     b = float(dc_baseline)
 
     expr = [
@@ -123,17 +129,18 @@ def save_signal_expression(expr_dir: Path, freqs_hz: torch.Tensor, xk: torch.Ten
             "s_coeffs_l1norm": s_n,
             "freqs_hz": freqs,
             "dc_baseline": b,
-            "note": "a/s have been L1-normalized so that Σ(|a|+|s|)=b; waveform in [0, 2*b]"
+            "note": "a/s 已按 L1 归一化使 Σ(|a|+|s|)=b；合成 4 相位范围在 [0, 2*b]"
         }, fp, ensure_ascii=False, indent=2)
 
 def _sanitize_img(x: torch.Tensor, peak: float) -> torch.Tensor:
-    # 防止 NaN/Inf 导致保存时报 warning / 崩溃
+    # 防止 NaN/Inf 导致保存报错
     x = torch.nan_to_num(x, nan=0.0, posinf=peak, neginf=0.0)
     return x.clamp(0, peak) / peak
 
 def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, max_depth_vis: float = 3.0):
     out_dir.mkdir(parents=True, exist_ok=True)
-    d = depth_m.detach().cpu().float().clamp(0, max_depth_vis)   # (H,W)
+    d = torch.nan_to_num(depth_m.detach().cpu().float(), nan=0.0, posinf=0.0, neginf=0.0)
+    d = d.clamp(0, max_depth_vis)                       # (H,W)
     d16 = (d / max_depth_vis * 65535.0).round().clamp(0, 65535).to(torch.uint16).numpy()
     Image.fromarray(d16).save(out_dir / f"depth16_{index:04d}.png")
 
@@ -228,14 +235,11 @@ def main():
     parser.add_argument("--corr_norm_mode", type=str, default="none", choices=["none","fixmean","fixl2"])
     parser.add_argument("--freq_l1_w", type=float, default=0.0, help="frequency-weighted L1 prior (0=off)")
     parser.add_argument("--freq_alpha", type=float, default=1.0)
-
     # 可选项：ZNCC 权重（from-depth 推荐 0.25）
     parser.add_argument("--zncc_w", type=float, default=0.25)
-
     # 兼容旗标：忽略但不报错，便于你继续用旧命令
     parser.add_argument("--train_from_depth", action="store_true",
                         help="(ignored) compatibility flag; from-depth is the only mode.")
-
     args = parser.parse_args()
 
     if args.train_from_depth:
@@ -308,7 +312,7 @@ def main():
 
     # ---------- Loss ----------
     loss_fn = PhaseMambaPhysLoss(
-        mae_w=1.0, ssim_w=0.5, zncc_w=args.zncc_w,   # <- 可选项
+        mae_w=1.0, ssim_w=0.5, zncc_w=args.zncc_w,
         edge_w=args.edge_w,
         ssim_use_depth_unit=True,
         ssim_max_val=1.0,
