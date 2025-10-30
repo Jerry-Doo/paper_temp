@@ -4,6 +4,7 @@
 # - Global shared waveform x_k (cos+sin; post_box bounds)
 # - Differentiable 4-phase synthesis (+ optional environment)
 # - From-Depth training path with "paper-like" sensor noise
+# - NEW: Closed-Loop Self-Consistency Refiner (CL-Refiner)
 # - Loss helper: MAE + SSIM + ZNCC (+ optional frequency prior)
 # - NUMERICAL STABILITY:
 #     * Correlation layer always computes cos/sin in float32
@@ -367,7 +368,7 @@ class Backbone(nn.Module):
         return feat, depth_raw, xk_raw
 
 
-# -------------------- main network --------------------
+# -------------------- main network (with CL-Refiner) --------------------
 class PhaseMambaNet(nn.Module):
     def __init__(self,
                  dim: int = 128,
@@ -460,6 +461,23 @@ class PhaseMambaNet(nn.Module):
         self._noise_fpnr = (0.0,   0.005)
         self._noise_fpnc = (0.0,   0.005)
 
+        # ---- NEW: CL-Refiner （把相位残差编码进网络，loss 不变）----
+        self.res_embed = nn.Sequential(
+            nn.Conv2d(4, dim, 3, padding=1), nn.GELU(),
+            nn.Conv2d(dim, dim, 3, padding=1), nn.GELU(),
+        )
+        self.dep_embed = nn.Sequential(
+            nn.Conv2d(1, dim, 3, padding=1), nn.GELU()
+        )
+        self.refine_fuse = nn.Sequential(
+            nn.Conv2d(dim * 3, dim, 3, padding=1), nn.GELU(),
+            nn.Conv2d(dim, dim, 3, padding=1), nn.GELU(),
+        )
+        self.delta_head = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1), nn.GELU(),
+            nn.Conv2d(dim, 1, 1)
+        )
+
     # ----- measured mode: removed -----
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Measured mode has been removed. Use forward_from_depth_train(gt_depth, ...).")
@@ -537,18 +555,20 @@ class PhaseMambaNet(nn.Module):
         else:
             return self._xk_from_post_box()
 
-    # ----- from-depth training path (paper style) -----
+    # ----- from-depth training path with CL-Refiner（loss 不变） -----
     def forward_from_depth_train(self, gt_depth: torch.Tensor,
                                  to_unit: bool = True, use_falloff: bool = False):
         """
-        1) use GT depth -> synth I_obs (env) -> add paper-like noise (train only)
-        2) backbone(I_obs) -> pred_depth
-        3) pred_depth -> synth pred_four_env (for zncc consistency)
+        1) GT depth -> synth I_obs (+noise)
+        2) backbone(I_obs) -> 粗深度 d1
+        3) d1 -> synth pred4_01_1; 残差 R = I_obs - pred4_01_1
+        4) [feat, R, d1] -> Refiner -> Δd -> d2
+        5) d2 -> synth pred4_01_2 (供 ZNCC 一致性)
         """
         device = next(self.parameters()).device
         gt_depth = _nan_safe(gt_depth.to(device), 0.0, self.dmax)
 
-        # (1) synth observation from GT depth
+        # (1) 合成观测 I_obs
         t_map_obs = depth_to_phase_t(gt_depth)
         xk = self.get_global_xk().to(device)          # [1,2K]
         B  = gt_depth.size(0)
@@ -558,34 +578,55 @@ class PhaseMambaNet(nn.Module):
             xkB, t_map_obs,
             beta=self.env_beta, kappa=self.env_kappa,
             lam_d=self.env_lam_d, gain=self.env_gain,
-            alpha=None, use_falloff=use_falloff, for_zncc=True
+            alpha=1, use_falloff=True, for_zncc=True
         )
         I_obs01 = self.corr.to_unit(I_obs_env) if to_unit else I_obs_env
         I_obs01 = _nan_safe(I_obs01, 0.0, 1.0)
         if self.training:
             I_obs01 = self.paper_noise(I_obs01)
 
-        # (2) predict depth
-        _, depth_raw, _ = self.backbone(I_obs01)
-        pred_depth = (torch.tanh(depth_raw) * 0.5 + 0.5) * self.dmax
-        pred_depth = _nan_safe(pred_depth, 0.0, self.dmax)
+        # (2) 粗深度 d1
+        feat, depth_raw, _ = self.backbone(I_obs01)
+        d1 = (torch.tanh(depth_raw) * 0.5 + 0.5) * self.dmax
+        d1 = _nan_safe(d1, 0.0, self.dmax)
 
-        # (3) synth from predicted depth for self-consistency
-        t_map_pred = depth_to_phase_t(pred_depth)
-        pred_four_env = self.corr.sample_map_env(
-            xkB, t_map_pred,
+        # (3) 用 d1 合成 4-phase，并算残差 R
+        t_map_pred1 = depth_to_phase_t(d1)
+        pred4_env1 = self.corr.sample_map_env(
+            xkB, t_map_pred1,
             beta=self.env_beta, kappa=self.env_kappa,
             lam_d=self.env_lam_d, gain=self.env_gain,
             alpha=None, use_falloff=use_falloff, for_zncc=True
         )
-        pred_four_env01 = _nan_safe(self.corr.to_unit(pred_four_env), 0.0, 1.0)
+        pred4_01_1 = _nan_safe(self.corr.to_unit(pred4_env1), 0.0, 1.0)
+        R = _nan_safe(I_obs01 - pred4_01_1, -1.0, 1.0)  # (B,4,H,W)
+
+        # (4) 闭环精炼：把 [feat, R, d1] 融合，预测 Δd（幅度限到 ±0.1*dmax）
+        r_feat = self.res_embed(R)
+        d_feat = self.dep_embed(d1)
+        fuse = torch.cat([feat, r_feat, d_feat], dim=1)     # (B, 3*dim, H, W)
+        rf = self.refine_fuse(fuse)
+        delta_raw = self.delta_head(rf)
+        d2 = d1 + 0.1 * self.dmax * torch.tanh(delta_raw)   # 10% dmax 微调
+        d2 = _nan_safe(d2, 0.0, self.dmax)
+
+        # (5) 用 d2 再合成 4-phase（给 ZNCC / 可视化）
+        t_map_pred2 = depth_to_phase_t(d2)
+        pred4_env2 = self.corr.sample_map_env(
+            xkB, t_map_pred2,
+            beta=self.env_beta, kappa=self.env_kappa,
+            lam_d=self.env_lam_d, gain=self.env_gain,
+            alpha=1, use_falloff=True, for_zncc=True
+        )
+        pred4_01_2 = _nan_safe(self.corr.to_unit(pred4_env2), 0.0, 1.0)
 
         extras = {
-            "I_obs_paper_like01": I_obs01,
-            "pred_four_phase_env":  _nan_safe(pred_four_env, 0.0, 2.0 * self.corr.dc_baseline),
-            "pred_four_phase_env01": pred_four_env01,
+            "I_obs_paper_like01": I_obs01,                 # 观测输入（0..1）
+            "pred_four_phase_env":  _nan_safe(pred4_env2, 0.0, 2.0 * self.corr.dc_baseline),
+            "pred_four_phase_env01": pred4_01_2,           # 闭环后的合成（0..1）
+            "residual_phase01": R,                         # 仅用于调试/可视化
         }
-        return xkB, pred_depth, extras
+        return xkB, d2, extras
 
 
 # -------------------- loss --------------------

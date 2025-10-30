@@ -1,4 +1,4 @@
-# train.py — Physics-aware iToF trainer (From-Depth only)
+# train.py — Physics-aware iToF trainer
 # -------------------------------------------------
 # Use GT depth to synthesize 4-phase in-graph, with differentiable physics.
 #
@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from model import PhaseMambaNet, PhaseMambaPhysLoss
+from modelone import PhaseMambaNet, PhaseMambaPhysLoss
 
 # ---------------- I/O ----------------
 def read_depth_image(path: Union[str, Path], depth_scale: Optional[float]) -> torch.Tensor:
