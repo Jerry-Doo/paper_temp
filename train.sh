@@ -1,0 +1,1 @@
+python train.py   --gt_dir ./nyu_output/depths   --save_dir runs/final   --zncc_w 0.4 --dim 128 --blocks 8 --amp --ema   --lr 2e-4 --lr_wave 2e-5 --bs 2 --accum 4   --freeze_wave_epochs 3   --noise_read 0.001 0.01 --noise_shot 0.0 0.02   --noise_gain 0.95 1.05 --noise_offs -0.02 0.02   --noise_fpnr 0.0 0.005 --noise_fpnc 0.0 0.005   --noise_bits 12
