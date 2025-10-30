@@ -20,7 +20,8 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from modelone import PhaseMambaNet, PhaseMambaPhysLoss
+# === 注意：此处按照你的工程命名，从 modelone 导入 ===
+from model import PhaseMambaNet, PhaseMambaPhysLoss
 
 # ---------------- I/O ----------------
 def read_depth_image(path: Union[str, Path], depth_scale: Optional[float]) -> torch.Tensor:
@@ -187,7 +188,11 @@ def main():
     parser.add_argument("--gt_dir", type=str, required=True, help="Folder with GT depth PNGs depth_XXXX.png")
     parser.add_argument("--depth_scale", type=float, default=1000.0, help="Divide raw depth by this if uint16/uint8")
     # Physics options
-    parser.add_argument("--use_falloff", action="store_true", help="Enable geometric falloff (d0/z)^2 in synthesis")
+    parser.add_argument("--use_falloff", dest="use_falloff", action="store_true",
+                        help="Enable geometric falloff (d0/z)^2 in synthesis")
+    parser.add_argument("--no_falloff", dest="use_falloff", action="store_false",
+                        help="Disable falloff")
+    parser.set_defaults(use_falloff=True)  # << 默认开启，与模型保持一致
     # Training
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--bs", type=int, default=2)
@@ -226,12 +231,19 @@ def main():
     parser.add_argument("--corr_norm_mode", type=str, default="none", choices=["none","fixmean","fixl2"])
     parser.add_argument("--freq_l1_w", type=float, default=0.0, help="frequency-weighted L1 prior (0=off)")
     parser.add_argument("--freq_alpha", type=float, default=1.0)
-    # 可选项：ZNCC 权重（from-depth 推荐 0.25）
+    # ZNCC 权重（from-depth 推荐 0.25）
     parser.add_argument("--zncc_w", type=float, default=0.25)
-    # 可选：早期冻结波形，避免发散
+    # 早期冻结波形，避免发散
     parser.add_argument("--freeze_wave_epochs", type=int, default=0)
-    # 可选：禁用合成噪声，用于排障
-    parser.add_argument("--no_noise", action="store_true")
+    # 训练时合成噪声：一键关闭或区间可配
+    parser.add_argument("--no_noise", action="store_true", help="Disable all sensor-like noise")
+    parser.add_argument("--noise_read", nargs=2, type=float, default=[0.001, 0.01], help="read noise std range")
+    parser.add_argument("--noise_shot", nargs=2, type=float, default=[0.0, 0.02], help="shot noise k range")
+    parser.add_argument("--noise_gain", nargs=2, type=float, default=[0.95, 1.05], help="gain jitter range")
+    parser.add_argument("--noise_offs", nargs=2, type=float, default=[-0.02, 0.02], help="offset jitter range")
+    parser.add_argument("--noise_fpnr", nargs=2, type=float, default=[0.0, 0.005], help="row FPN amplitude")
+    parser.add_argument("--noise_fpnc", nargs=2, type=float, default=[0.0, 0.005], help="col FPN amplitude")
+    parser.add_argument("--noise_bits", type=int, default=12, help="quantization bits; 0 disables quantization")
     # 兼容旗标（忽略）
     parser.add_argument("--train_from_depth", action="store_true",
                         help="(ignored) From-depth is the only mode.")
@@ -244,6 +256,7 @@ def main():
         print("[WARN] CUDA requested but not available; falling back to CPU.")
         args.device = "cpu"
     torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
+    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
 
     save_dir = Path(args.save_dir)
     (save_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -305,15 +318,16 @@ def main():
         xk_min=xk_min, xk_max=xk_max,
     ).to(args.device)
 
-    # 关闭噪声（排障选项）
+    # ---------- 配置传感器噪声 ----------
     if args.no_noise:
-        model._noise_read = (0.0, 0.0)
-        model._noise_shot = (0.0, 0.0)
-        model._noise_gain = (1.0, 1.0)
-        model._noise_offs = (0.0, 0.0)
-        model._noise_fpnr = (0.0, 0.0)
-        model._noise_fpnc = (0.0, 0.0)
+        model.set_noise_ranges(read=(0.0,0.0), shot=(0.0,0.0), gain=(1.0,1.0), offs=(0.0,0.0),
+                               fpnr=(0.0,0.0), fpnc=(0.0,0.0), bits=0)
         print("[Info] Paper-like sensor noise is DISABLED (--no_noise).")
+    else:
+        model.set_noise_ranges(read=args.noise_read, shot=args.noise_shot,
+                               gain=args.noise_gain, offs=args.noise_offs,
+                               fpnr=args.noise_fpnr, fpnc=args.noise_fpnc,
+                               bits=args.noise_bits)
 
     # ---------- Loss ----------
     loss_fn = PhaseMambaPhysLoss(
@@ -367,9 +381,6 @@ def main():
     for epoch in range(1, args.epochs + 1):
         # 冻结波形参数（可选）
         freeze_wave = epoch <= max(0, args.freeze_wave_epochs)
-        for g in optimizer.param_groups:
-            if "params" in g and len(g["params"]) > 0:
-                pass
         if freeze_wave and len(wave_params) > 0:
             for p in wave_params: p.requires_grad_(False)
         else:
@@ -493,9 +504,6 @@ def main():
                         idx = int(batch["index"][b])
                         I_obs = extras.get("I_obs_paper_like01")[b]
                         save_four_phase_processed(vis_ep_dir, I_obs, idx, prefix="obs_paper01", peak=1.0)
-                        #synth4 = extras.get("pred_four_phase_env")[b] if "pred_four_phase_env" in extras else None
-                        #if synth4 is not None:
-                        #    save_four_phase_processed(vis_ep_dir, synth4, idx, prefix="pred_phase", peak=2*args.corr_dc)
                         save_depth_16bit_and_rgb(vis_ep_dir, pred_depth[b, 0], idx,
                                                  max_depth_vis=args.max_depth_vis)
                         save_signal_expression(expr_ep_dir, model.corr.freqs_hz, pred_xk[b].cpu(), idx,

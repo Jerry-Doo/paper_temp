@@ -1,13 +1,12 @@
-# model.py
 # ============================================================
-# Physics-aware iToF network (From-Depth only, measured removed)
+# Physics-aware iToF network (From-Depth only; measured path removed)
 # - Global shared waveform x_k (cos+sin; post_box bounds)
-# - Differentiable 4-phase synthesis (+ optional environment)
-# - From-Depth training path with "paper-like" sensor noise
+# - Differentiable 4-phase synthesis (+ environment; Falloff ON, alpha=1)
+# - From-Depth training path with configurable "paper-like" sensor noise
 # - NEW: Closed-Loop Self-Consistency Refiner (CL-Refiner)
 # - Loss helper: MAE + SSIM + ZNCC (+ optional frequency prior)
 # - NUMERICAL STABILITY:
-#     * Correlation layer always computes cos/sin in float32
+#     * Correlation layer computes cos/sin in float32
 #     * nan_to_num() on all synthesized/intermediate tensors
 #     * Environment / waveform param clamping + sanitize_()
 # ============================================================
@@ -116,6 +115,14 @@ class CorrelationSynthesizer(nn.Module):
         self.enforce_l1_to_dc = bool(enforce_l1_to_dc)
         self.use_soft_clip = bool(use_soft_clip)
         self.soft_clip_temp = float(soft_clip_temp)
+        self._noise_read = (0.001, 0.01)
+        self._noise_shot = (0.0,   0.02)
+        self._noise_gain = (0.95,  1.05)
+        self._noise_offs = (-0.02, 0.02)
+        self._noise_fpnr = (0.0,   0.005)
+        self._noise_fpnc = (0.0,   0.005)
+        self._noise_bits = 12   # 量化位数；0 表示不量化
+
 
     # ----- helpers -----
     def _split_coeffs(self, xk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -453,13 +460,14 @@ class PhaseMambaNet(nn.Module):
         self.env_gain  = nn.Parameter(torch.tensor(1.0))
         self.env_kappa = nn.Parameter(torch.ones(4))
 
-        # built-in "paper-like" sensor noise (only used in from-depth train path)
+        # ---- NEW: configurable "paper-like" sensor noise (training only) ----
         self._noise_read = (0.001, 0.01)
         self._noise_shot = (0.0,   0.02)
         self._noise_gain = (0.95,  1.05)
         self._noise_offs = (-0.02, 0.02)
         self._noise_fpnr = (0.0,   0.005)
         self._noise_fpnc = (0.0,   0.005)
+        self._noise_bits = 12  # quantization bits; 0 -> disable
 
         # ---- NEW: CL-Refiner （把相位残差编码进网络，loss 不变）----
         self.res_embed = nn.Sequential(
@@ -482,10 +490,22 @@ class PhaseMambaNet(nn.Module):
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Measured mode has been removed. Use forward_from_depth_train(gt_depth, ...).")
 
+    # ----- NEW: noise config setter -----
+    def set_noise_ranges(self, read=None, shot=None, gain=None, offs=None,
+                     fpnr=None, fpnc=None, bits: int | None = None):
+        """Configure 'paper-like' sensor noise ranges (training-time only)."""
+        if read is not None: self._noise_read = tuple(read)
+        if shot is not None: self._noise_shot = tuple(shot)
+        if gain is not None: self._noise_gain = tuple(gain)
+        if offs is not None: self._noise_offs = tuple(offs)
+        if fpnr is not None: self._noise_fpnr = tuple(fpnr)
+        if fpnc is not None: self._noise_fpnc = tuple(fpnc)
+        if bits is not None: self._noise_bits = int(bits)
+
     # ----- helper: paper-like noise with dtype-safety -----
     def paper_noise(self, img4: torch.Tensor) -> torch.Tensor:
         """
-        Add read/shot/gain/offset + row/col FPN + 12-bit quantization.
+        Add read/shot/gain/offset + row/col FPN + N-bit quantization.
         img4: (B,4,H,W) in [0,1]; keep dtype
         """
         x = _nan_safe(img4, 0.0, 1.0)
@@ -512,8 +532,9 @@ class PhaseMambaNet(nn.Module):
         if col_amp > 0.0:
             y = y + torch.randn(B, 1, 1, W, device=device, dtype=dtype) * col_amp
 
-        levels = (1 << 12) - 1
-        y = torch.round(_nan_safe(y, 0.0, 1.0) * levels) / levels
+        if self._noise_bits and self._noise_bits > 0:
+            levels = (1 << int(self._noise_bits)) - 1
+            y = torch.round(_nan_safe(y, 0.0, 1.0) * levels) / levels
         return _nan_safe(y, 0.0, 1.0)
 
     # ----- parameter safety -----
@@ -557,7 +578,7 @@ class PhaseMambaNet(nn.Module):
 
     # ----- from-depth training path with CL-Refiner（loss 不变） -----
     def forward_from_depth_train(self, gt_depth: torch.Tensor,
-                                 to_unit: bool = True, use_falloff: bool = False):
+                                 to_unit: bool = True, use_falloff: bool = True):
         """
         1) GT depth -> synth I_obs (+noise)
         2) backbone(I_obs) -> 粗深度 d1
@@ -568,7 +589,7 @@ class PhaseMambaNet(nn.Module):
         device = next(self.parameters()).device
         gt_depth = _nan_safe(gt_depth.to(device), 0.0, self.dmax)
 
-        # (1) 合成观测 I_obs
+        # (1) 合成观测 I_obs  (alpha=1, falloff=ON)
         t_map_obs = depth_to_phase_t(gt_depth)
         xk = self.get_global_xk().to(device)          # [1,2K]
         B  = gt_depth.size(0)
@@ -590,13 +611,13 @@ class PhaseMambaNet(nn.Module):
         d1 = (torch.tanh(depth_raw) * 0.5 + 0.5) * self.dmax
         d1 = _nan_safe(d1, 0.0, self.dmax)
 
-        # (3) 用 d1 合成 4-phase，并算残差 R
+        # (3) 用 d1 合成 4-phase，并算残差 R  (alpha=1, falloff=ON)
         t_map_pred1 = depth_to_phase_t(d1)
         pred4_env1 = self.corr.sample_map_env(
             xkB, t_map_pred1,
             beta=self.env_beta, kappa=self.env_kappa,
             lam_d=self.env_lam_d, gain=self.env_gain,
-            alpha=None, use_falloff=use_falloff, for_zncc=True
+            alpha=1, use_falloff=True, for_zncc=True
         )
         pred4_01_1 = _nan_safe(self.corr.to_unit(pred4_env1), 0.0, 1.0)
         R = _nan_safe(I_obs01 - pred4_01_1, -1.0, 1.0)  # (B,4,H,W)
@@ -610,7 +631,7 @@ class PhaseMambaNet(nn.Module):
         d2 = d1 + 0.1 * self.dmax * torch.tanh(delta_raw)   # 10% dmax 微调
         d2 = _nan_safe(d2, 0.0, self.dmax)
 
-        # (5) 用 d2 再合成 4-phase（给 ZNCC / 可视化）
+        # (5) 用 d2 再合成 4-phase（给 ZNCC / 可视化） (alpha=1, falloff=ON)
         t_map_pred2 = depth_to_phase_t(d2)
         pred4_env2 = self.corr.sample_map_env(
             xkB, t_map_pred2,
