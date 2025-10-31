@@ -70,8 +70,7 @@ def build_splits_depth(gt_dir: Union[str, Path]) -> Tuple[List[int], List[int]]:
         if m:
             idxs.append(int(m.group(1)))
     idxs_s = sorted(idxs)
-    n = len(idxs_s)
-    k = int(n * 0.7) if n >= 10 else max(1, n * 7 // 10)
+    k = 1000
     train_idx = idxs_s[:k]
     test_idx = idxs_s[k:]
     return train_idx, test_idx
@@ -389,19 +388,21 @@ def main():
         return True
 
     for epoch in range(1, args.epochs + 1):
-    # ---- 你原来的：冻结波形参数（可选） ----
+    # ---- 冻结波形参数（可选）----
         freeze_wave = epoch <= max(0, args.freeze_wave_epochs)
         if freeze_wave and len(wave_params) > 0:
-            for p in wave_params: p.requires_grad_(False)
+            for p in wave_params:
+                p.requires_grad_(False)
         else:
-            for p in wave_params: p.requires_grad_(True)
+            for p in wave_params:
+                p.requires_grad_(True)
 
-        # ================== 这里插入【Stage scheduler】开始 ==================
+        # ================== 【Stage scheduler】开始 ==================
         # 1) falloff 开关（按 epoch 打开）
-        # 注意：如果你的 argparse 用了 "--use_falloff/--no_falloff" 互斥开关，
+        # 注意：如果 argparse 用了 "--use_falloff/--no_falloff" 互斥开关，
         # 变量名通常是 args.use_falloff（布尔）。下面写法兼容这点：
         use_falloff_e = args.use_falloff
-        if not args.use_falloff:                     # 一开始禁用，则按 epoch 打开
+        if not args.use_falloff:  # 一开始禁用，则按 epoch 打开
             use_falloff_e = (epoch >= args.open_falloff_epoch)
 
         # 2) 环境项冻结/解冻
@@ -416,14 +417,14 @@ def main():
 
         if not args.no_noise:
             if epoch < args.open_noise_epoch:
-                model.set_noise_ranges(read=(0,0), shot=(0,0), gain=(1,1),
-                                    offs=(0,0), fpnr=(0,0), fpnc=(0,0), bits=0)
+                model.set_noise_ranges(read=(0, 0), shot=(0, 0), gain=(1, 1),
+                                    offs=(0, 0), fpnr=(0, 0), fpnc=(0, 0), bits=0)
             else:
                 r = min(1.0, (epoch - args.open_noise_epoch + 1) / max(1, args.noise_ramp_epochs))
                 model.set_noise_ranges(
                     read=_scale_rng(args.noise_read, r),
                     shot=_scale_rng(args.noise_shot, r),
-                    gain=(1 + (args.noise_gain[0]-1)*r, 1 + (args.noise_gain[1]-1)*r),
+                    gain=(1 + (args.noise_gain[0] - 1) * r, 1 + (args.noise_gain[1] - 1) * r),
                     offs=_scale_rng(args.noise_offs, r),
                     fpnr=_scale_rng(args.noise_fpnr, r),
                     fpnc=_scale_rng(args.noise_fpnc, r),
@@ -487,17 +488,17 @@ def main():
             if not args.no_pbar:
                 pbar.set_postfix({
                     "loss": float(total.detach()),
-                    "mae":  float(logs.get("mae", 0.0)),
+                    "mae": float(logs.get("mae", 0.0)),
                     "ssim": float(logs.get("ssim", 0.0)),
                     "zncc": float(logs.get("zncc", 0.0)),
-                    "lr":   optimizer.param_groups[0]["lr"],
+                    "lr": optimizer.param_groups[0]["lr"],
                     "lr_w": optimizer.param_groups[1]["lr"],
                 })
 
         checksum_after = param_checksum(model)
         print(f"[epoch {epoch}] param_delta={(checksum_after - checksum_before):.4e}  "
-              f"env(gain={float(model.env_gain.detach()):.3f}, beta={float(model.env_beta.detach()):.3f}, "
-              f"lam_d={float(model.env_lam_d.detach()):.3f})")
+            f"env(gain={float(model.env_gain.detach()):.3f}, beta={float(model.env_beta.detach()):.3f}, "
+            f"lam_d={float(model.env_lam_d.detach()):.3f})")
 
         # -------- Validate --------
         model.eval()
@@ -507,16 +508,16 @@ def main():
         val_loss, val_n = 0.0, 0
         with torch.no_grad():
             pbar_v = tqdm(test_loader, desc=f"Epoch {epoch}/{args.epochs} [valid]",
-                          disable=(args.no_pbar or args.export_four_phase))
+                        disable=(args.no_pbar or args.export_four_phase))
 
             # Output dirs (per-epoch or rolling)
             if args.keep_all_epochs:
-                vis_ep_dir  = (save_dir / "vis"  / f"ep_{epoch:03d}")
+                vis_ep_dir = (save_dir / "vis" / f"ep_{epoch:03d}")
                 expr_ep_dir = (save_dir / "expr" / f"ep_{epoch:03d}")
                 vis_ep_dir.mkdir(parents=True, exist_ok=True)
                 expr_ep_dir.mkdir(parents=True, exist_ok=True)
             else:
-                vis_ep_dir  = (save_dir / "vis")
+                vis_ep_dir = (save_dir / "vis")
                 expr_ep_dir = (save_dir / "expr")
                 reset_dir(vis_ep_dir)
                 reset_dir(expr_ep_dir)
@@ -543,12 +544,12 @@ def main():
 
                 bs = gt_depth.size(0)
                 val_loss += float(total) * bs
-                val_n    += bs
+                val_n += bs
 
                 if i == 0:
                     print("[valid stats]",
-                          "pred_depth", tensor_stats(pred_depth),
-                          "| gt_depth", tensor_stats(gt_depth))
+                        "pred_depth", tensor_stats(pred_depth),
+                        "| gt_depth", tensor_stats(gt_depth))
 
                 if args.export_four_phase:
                     for b in range(bs):
@@ -556,9 +557,9 @@ def main():
                         I_obs = extras.get("I_obs_paper_like01")[b]
                         save_four_phase_processed(vis_ep_dir, I_obs, idx, prefix="obs_paper01", peak=1.0)
                         save_depth_16bit_and_rgb(vis_ep_dir, pred_depth[b, 0], idx,
-                                                 max_depth_vis=args.max_depth_vis)
+                                                max_depth_vis=args.max_depth_vis)
                         save_signal_expression(expr_ep_dir, model.corr.freqs_hz, pred_xk[b].cpu(), idx,
-                                               dc_baseline=args.corr_dc)
+                                            dc_baseline=args.corr_dc)
 
         val_loss = val_loss / max(val_n, 1)
         print(f"[epoch {epoch}] val loss: {val_loss:.6f}")
@@ -590,14 +591,58 @@ def main():
             if best_ckpt.exists():
                 state = torch.load(best_ckpt, map_location=args.device)
                 model.load_state_dict(state["model"])
-                print(f"[plateau] LRs reduced {prev_lr0:.2e}->{new_lr0:.2e} (base), {prev_lr1:.2e}->{new_lr1:.2e} (wave); rewind to best (epoch {state.get('epoch','?')})")
+                print(f"[plateau] LRs reduced {prev_lr0:.2e}->{new_lr0:.2e} (base), "
+                    f"{prev_lr1:.2e}->{new_lr1:.2e} (wave); rewind to best (epoch {state.get('epoch','?')})")
+
         # 额外安全：每轮结束再清洗一次
         if hasattr(model, "sanitize_"):
             model.sanitize_()
+    # ←←← for epoch 循环结束
+
+    # === Always export last-epoch results: depth(16bit+RGB) + frequency params ===
+    try:
+        model.eval()
+        if use_ema:
+            ema.apply(model)
+
+        final_dir = save_dir / "final"   # 固定导出到 <save_dir>/final/
+        # 保留“最后一次”的结果：清空后再写入；如需累计历史，可改成 final_dir.mkdir(..., exist_ok=True)
+        reset_dir(final_dir)
+
+        with torch.no_grad():
+            # 优先从验证集取一个 batch；若验证集为空则回退训练集
+            loader_for_export = test_loader if len(test_ds) > 0 else train_loader
+            batch = next(iter(loader_for_export))
+            gt_depth = batch["gt_depth"].to(args.device, non_blocking=True)
+
+            # 前向一次（eval 模式；不会再注入训练噪声）
+            pred_xk, pred_depth, _ = model.forward_from_depth_train(
+                gt_depth, to_unit=True, use_falloff=args.use_falloff
+            )
+
+            # 索引号（数据集未提供 index 时用 9999）
+            idx0 = int(batch["index"][0]) if "index" in batch else 9999
+
+            # 1) 最终深度（16-bit + 伪彩 RGB）
+            save_depth_16bit_and_rgb(final_dir, pred_depth[0, 0], idx0,
+                                    max_depth_vis=args.max_depth_vis)
+
+            # 2) 频率参数表达（全局 x_k 的 a/s 系数 + 频率表）
+            #    pred_xk 是按 batch 展开的全局向量，取第一个即可
+            save_signal_expression(final_dir, model.corr.freqs_hz,
+                                pred_xk[0].detach().cpu(), idx0,
+                                dc_baseline=args.corr_dc)
+
+        print(f"[final export] saved to: {str(final_dir)}")
+        if use_ema:
+            ema.restore(model)
+    except Exception as e:
+        print(f"[final export] skipped due to error: {e}")
 
     print("Done.",
-          "Depth outputs ->", str(save_dir / "vis"),
-          "| Expressions ->", str(save_dir / "expr"))
+        "Depth outputs ->", str(save_dir / "vis"),
+        "| Expressions ->", str(save_dir / "expr"))
+
 
 if __name__ == "__main__":
     main()
