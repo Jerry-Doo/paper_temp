@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-# === 注意：此处按照你的工程命名，从 modelone 导入 ===
+# === 从 model 导入 ===
 from model import PhaseMambaNet, PhaseMambaPhysLoss
 
 # ---------------- I/O ----------------
@@ -244,6 +244,16 @@ def main():
     parser.add_argument("--noise_fpnr", nargs=2, type=float, default=[0.0, 0.005], help="row FPN amplitude")
     parser.add_argument("--noise_fpnc", nargs=2, type=float, default=[0.0, 0.005], help="col FPN amplitude")
     parser.add_argument("--noise_bits", type=int, default=12, help="quantization bits; 0 disables quantization")
+    # Curriculum switches
+    parser.add_argument("--open_falloff_epoch", type=int, default=4)
+    parser.add_argument("--open_noise_epoch", type=int, default=7)
+    parser.add_argument("--noise_ramp_epochs", type=int, default=10)  # 线性从 0->1
+    parser.add_argument("--zncc_w_start", type=float, default=0.10)
+    parser.add_argument("--zncc_w_final", type=float, default=0.40)
+    parser.add_argument("--zncc_w_warmup_epochs", type=int, default=8)
+    parser.add_argument("--freeze_env_epochs", type=int, default=0,
+                    help="在前 N 个 epoch 冻结环境参数(gain/beta/lam_d/kappa)")
+
     # 兼容旗标（忽略）
     parser.add_argument("--train_from_depth", action="store_true",
                         help="(ignored) From-depth is the only mode.")
@@ -379,12 +389,53 @@ def main():
         return True
 
     for epoch in range(1, args.epochs + 1):
-        # 冻结波形参数（可选）
+    # ---- 你原来的：冻结波形参数（可选） ----
         freeze_wave = epoch <= max(0, args.freeze_wave_epochs)
         if freeze_wave and len(wave_params) > 0:
             for p in wave_params: p.requires_grad_(False)
         else:
             for p in wave_params: p.requires_grad_(True)
+
+        # ================== 这里插入【Stage scheduler】开始 ==================
+        # 1) falloff 开关（按 epoch 打开）
+        # 注意：如果你的 argparse 用了 "--use_falloff/--no_falloff" 互斥开关，
+        # 变量名通常是 args.use_falloff（布尔）。下面写法兼容这点：
+        use_falloff_e = args.use_falloff
+        if not args.use_falloff:                     # 一开始禁用，则按 epoch 打开
+            use_falloff_e = (epoch >= args.open_falloff_epoch)
+
+        # 2) 环境项冻结/解冻
+        for p in [model.env_gain, model.env_beta, model.env_lam_d, model.env_kappa]:
+            p.requires_grad_(epoch > args.freeze_env_epochs)
+
+        # 3) 噪声 ramp（如果希望后面自动开启，不要在命令行加 --no_noise；
+        #    若一定要用 --no_noise 但仍想后期开启，把下一行的 if 条件改成 True）
+        def _scale_rng(rng, s):
+            lo, hi = float(rng[0]), float(rng[1])
+            return (lo * s, hi * s)
+
+        if not args.no_noise:
+            if epoch < args.open_noise_epoch:
+                model.set_noise_ranges(read=(0,0), shot=(0,0), gain=(1,1),
+                                    offs=(0,0), fpnr=(0,0), fpnc=(0,0), bits=0)
+            else:
+                r = min(1.0, (epoch - args.open_noise_epoch + 1) / max(1, args.noise_ramp_epochs))
+                model.set_noise_ranges(
+                    read=_scale_rng(args.noise_read, r),
+                    shot=_scale_rng(args.noise_shot, r),
+                    gain=(1 + (args.noise_gain[0]-1)*r, 1 + (args.noise_gain[1]-1)*r),
+                    offs=_scale_rng(args.noise_offs, r),
+                    fpnr=_scale_rng(args.noise_fpnr, r),
+                    fpnc=_scale_rng(args.noise_fpnc, r),
+                    bits=args.noise_bits if r >= 0.7 else 0
+                )
+
+        # 4) ZNCC 权重 ramp
+        if hasattr(loss_fn, "zncc_w"):
+            z = 0.0
+            if epoch >= args.open_noise_epoch:
+                z = min(1.0, (epoch - args.open_noise_epoch + 1) / max(1, args.zncc_w_warmup_epochs))
+            loss_fn.zncc_w = args.zncc_w_start + (args.zncc_w_final - args.zncc_w_start) * z
 
         # -------- Train --------
         model.train()
@@ -403,7 +454,7 @@ def main():
             ctx = torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_amp)
             with ctx:
                 pred_xk, pred_depth, extras = model.forward_from_depth_train(
-                    gt_depth, to_unit=True, use_falloff=args.use_falloff
+                    gt_depth, to_unit=True, use_falloff=use_falloff_e
                 )
                 total, logs = loss_fn(
                     pred_depth=pred_depth,
