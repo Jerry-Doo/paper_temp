@@ -1,1 +1,10 @@
-python train.py   --gt_dir ./nyu_output/depths --save_dir runs/curriculum   --dim 128 --blocks 8 --bs 2 --accum 4   --lr 2e-4 --lr_wave 2e-5 --patience 20 --lr_min 2e-5 --rewind_on_plateau   --corr_norm_mode fixmean   --no_noise --no_falloff   --open_falloff_epoch 4   --open_noise_epoch 7 --noise_ramp_epochs 10   --zncc_w_start 0.10 --zncc_w_final 0.40 --zncc_w_warmup_epochs 8
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 trainn.py \
+  --gt_dir ./nyu_output/depths --rgb_dir ./nyu_output/images \
+  --depth_scale 1000 --no-depth_is_z --dmax 10 \
+  --epochs 2000 --early_stop --es_metric val_mae \
+  --bs 1 --accum 8 \
+  --lr 1e-4 --lr_wave 1e-5 \
+  --amp --amp_dtype bf16 \
+  --use_mamba --no-mamba_force_fp32 \
+  --train_size 320x240 \
+  --save_dir runs/nyu_ddp_mamba_bs1a8 --clean_save
