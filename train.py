@@ -1,18 +1,3 @@
-# ============================================================
-# train.py — Pure iToF trainer (DDP-ready, robust) — with Early Stop & clean export
-#
-# 变更概要：
-# * 数据划分：前 1000 -> train，其余 -> test（若不足 1000 则全用于训练）
-# * DDP：torchrun --standalone --nproc_per_node=N
-# * 打印每个 epoch 的 train/valid 首个 batch 的 min/mean/max
-# * 训练期可降采样（自动缩放内参）
-# * 多尺度 ZNCC：--ms_zncc_scales / --ms_zncc_weights
-# * Mamba 可选 + 强制 FP32 内核；AMP dtype 可选
-# * 早停：基于验证集 val_mae（默认）或 val_loss 的稳定性；epochs 为上限
-# * 最终导出：去噪 16-bit 深度（显示编码 + 毫米编码）、伪彩、xk_global.json（不保存输入 RGB 原图）
-# * 导出前自动加载 best.pt + 应用 EMA；同时计算并保存 MAE/RMSE（米制）到 metrics.json
-# ============================================================
-
 import os, re, argparse, random, json, shutil
 from pathlib import Path
 from typing import Optional, List, Union, Tuple
@@ -35,12 +20,7 @@ from model import PhaseMambaNet, PhaseMambaPhysLoss
 
 # ---------------- I/O ----------------
 def read_depth_image(path: Union[str, Path], depth_scale: Optional[float]) -> torch.Tensor:
-    """
-    读取深度图：
-    - uint16: 认为单位为整数单位（常见：毫米），按 depth_scale (默认 1000) 转米；
-    - uint8 : 需要显式给 depth_scale，否则报错；
-    - float: 默认认为已是“米”，不再做启发式缩放（避免误判造成二次缩放）。
-    """
+
     im = Image.open(path)
     arr = np.array(im)
     if arr.dtype == np.uint16:
@@ -51,7 +31,7 @@ def read_depth_image(path: Union[str, Path], depth_scale: Optional[float]) -> to
             raise ValueError(f"{path} is 8-bit; please set --depth_scale")
         depth = torch.from_numpy(arr.astype(np.float32)) / float(depth_scale)
     else:
-        # 假定 float 已是米，不做自动缩放（避免被误判 >1.5 而除以 1000）
+
         depth = torch.from_numpy(arr.astype(np.float32))
     return depth  # (H,W), meters
 
@@ -142,7 +122,7 @@ def list_indices(gt_dir: Union[str, Path]) -> List[int]:
     return sorted(idxs)
 
 def build_splits_depth(gt_dir: Union[str, Path]) -> Tuple[List[int], List[int]]:
-    """固定：前1000训练，其余测试（若不足1000则全用作训练）"""
+
     idxs_s = list_indices(gt_dir)
     k = min(1000, len(idxs_s))
     return idxs_s[:k], idxs_s[k:]
@@ -161,12 +141,7 @@ def tensor_stats(x: torch.Tensor) -> str:
     return f"min={float(x.min()):.4f} mean={float(x.mean()):.4f} max={float(x.max()):.4f}"
 
 def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, max_depth_vis: float = 10.0):
-    """
-    保存两张图：
-    1) depth16_{:04d}.png  —— 16-bit 显示编码（[0,dmax] 线性映射到 [0,65535]），便于可视化；
-    2) depth16_rgb_{:04d}.png —— 伪彩便于目视检查。
-    注意：这不是毫米编码。
-    """
+
     out_dir.mkdir(parents=True, exist_ok=True)
     d = depth_m.detach().cpu().float().clamp(0, max_depth_vis)   # (H,W), meters
     d16 = (d / max_depth_vis * 65535.0).round().clamp(0, 65535).to(torch.uint16).numpy()
@@ -180,12 +155,9 @@ def save_depth_16bit_and_rgb(out_dir: Path, depth_m: torch.Tensor, index: int, m
     Image.fromarray(rgb).save(out_dir / f"depth16_rgb_{index:04d}.png")
 
 def save_depth_16bit_mm(out_dir: Path, depth_m: torch.Tensor, index: int):
-    """
-    保存毫米编码的 16-bit PNG：depth16mm_{:04d}.png
-    这张图的编码与常见 GT (uint16 毫米) 完全一致，适合做像素级对比/评估。
-    """
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    d_mm = (depth_m.detach().cpu().float().clamp(min=0) * 1000.0)  # 米->毫米
+    d_mm = (depth_m.detach().cpu().float().clamp(min=0) * 1000.0)
     d16 = d_mm.round().clamp(0, 65535).to(torch.uint16).numpy()
     Image.fromarray(d16).save(out_dir / f"depth16mm_{index:04d}.png")
 
@@ -228,12 +200,7 @@ def unwrap(model):
 # --------------- Early Stopping ---------------
 class EarlyStopper:
     def __init__(self, metric_name: str = "val_mae", patience: int = 20, min_delta: float = 1e-3, warmup_epochs: int = 10):
-        """
-        metric_name: 'val_mae' 或 'val_loss'
-        patience   : 连续多少个 epoch 没有超过 min_delta 的改进则早停
-        min_delta  : 最小改进阈值（绝对值）
-        warmup_epochs: 前多少个 epoch 不参与早停计数
-        """
+
         self.metric_name = metric_name
         self.patience = int(patience)
         self.min_delta = float(min_delta)
@@ -437,30 +404,18 @@ def main():
         print(f"[Info] Intrinsics: fx={intrinsics_base[0]:.3f}, fy={intrinsics_base[1]:.3f}, "
               f"cx={intrinsics_base[2]:.3f}, cy={intrinsics_base[3]:.3f}")
 
-    # waveform bounds（与你之前一致）
+
     cos_min = torch.tensor([
-        0.0247367180319292, -0.218511647188518, -0.128039900641918, -0.188089030029964,
-        -0.101271446313554, -0.0739265690272022, -0.0517185888075761, -0.0470680503186579,
-        -0.0429835203719536, -0.0113244401026370, -0.0867256924442522, -0.0398804608758447,
-        -0.0255234949605406, -0.0204187959684325, -0.0163350367747460
+        
     ], dtype=torch.float32)
     cos_max = torch.tensor([
-        1.000000562151060, 0.246269657347430, 0.172776779981168, 0.067885132423475,
-        0.054348930049410, 0.0110355732644022, 0.0079027851216088, 0.0073635999741769,
-        0.0075220109866885, 0.0071864386286823, 0.0059862393148076, 0.0108529551727735,
-        0.00507913000000000, 0.0050842000000000, 0.0044896000000000
+        
     ], dtype=torch.float32)
     sin_min = torch.tensor([
-        -0.292903812153803, -0.133624174055044, -0.0765348572830997, -0.0384905669003143,
-        -0.0313234820028485, -0.0303887103998798, -0.0452395377084766, -0.0344357506637897,
-        -0.0309456571202258, -0.0212468035562158, -0.0146363445052302, -0.0149122298097099,
-        -0.0127050000000000, -0.0108800000000000, -0.0094200000000000
+        
     ], dtype=torch.float32)
     sin_max = torch.tensor([
-        0.305261167400373, 0.119887020570952, 0.0706313176834897, 0.0397174345064721,
-        0.0344136176416263, 0.0266434058843329, 0.0403971596620880, 0.00367550978888006,
-        0.00348480445863076, 0.00284442773359534, 0.00325240839414840, 0.00268676948278312,
-        0.00241000000000000, 0.00213000000000000, 0.00189000000000000
+        
     ], dtype=torch.float32)
     xk_min = torch.cat([cos_min, sin_min], dim=0)
     xk_max = torch.cat([cos_max, sin_max], dim=0)
@@ -478,7 +433,7 @@ def main():
         use_mamba=args.use_mamba,
         mamba_force_fp32=args.mamba_force_fp32
     ).to(args.device)
-    # 写入盒子（覆盖为统计盒子）
+
     model.set_waveform_box(xk_min, xk_max)
 
     # wrap DDP
@@ -607,7 +562,7 @@ def main():
                     gt_depth, rgb=rgb, intrinsics=intr, to_unit=True
                 )
 
-                # ===== DBG（仅 rank0 的首个 batch 打印）=====
+
                 if is_main and i == 0:
                     print("[dbg/train] I_pred01:",
                         f"{extras['I_pred01'].min().item():.3e}",
@@ -652,7 +607,7 @@ def main():
                 if use_ema: ema.update(unwrap(model))
                 optimizer.zero_grad(set_to_none=True)
 
-            # rank0 的首个 batch 打统计
+
             if is_main and i == 0 and (not args.no_pbar):
                 print(f"[train stats] I_obs01 {tensor_stats(extras['I_obs01'])} | "
                       f"pred_depth {tensor_stats(pred_depth)} | gt_depth {tensor_stats(gt_depth)}")
@@ -722,8 +677,6 @@ def main():
             print(f"[epoch {epoch}] val loss: {val_loss:.6f} | val mae(m): {val_mae:.6f} | "
                   f"val ssim: {val_ssim:.6f} | val zncc: {val_zncc:.6f}")
 
-        if use_ema: ema.restore(unwrap(model))
-
         # Save best/last only on rank0（以 val_loss 为保存 best 的标准，但会打印 best_mae）
         if is_main:
             ckpt_dir = Path(args.save_dir) / "checkpoints"
@@ -737,10 +690,10 @@ def main():
                 print(f"  -> saved best (val_loss {val_loss:.6f}, val_mae {val_mae:.6f})")
             torch.save({"model": unwrap(model).state_dict(), "epoch": epoch, "val_loss": val_loss, "val_mae": val_mae}, ckpt_dir / "last.pt")
 
-        # LR schedule（所有 rank 同步步长）
+
         scheduler.step(val_loss)
 
-        # Early stop check（rank0 决策，广播给所有 rank）
+
         stop_flag = torch.tensor([0], device=args.device)
         if args.early_stop and is_main:
             es_metric_val = val_mae if args.es_metric == "val_mae" else val_loss
@@ -766,7 +719,7 @@ def main():
         out_dir = Path(args.save_dir) / "final"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # 导出前：加载 best 权重 + EMA
+
         best_path = Path(args.save_dir) / "checkpoints" / "best.pt"
         if best_path.exists():
             print(f"[final export] loading best from: {best_path}")
@@ -790,12 +743,11 @@ def main():
 
                 gt_depth = read_depth_image(str(gt_path), args.depth_scale).unsqueeze(0).unsqueeze(0).to(args.device)  # meters
 
-                # 找 RGB 用于推理（但不会导出 RGB）
                 if not rgb_path.exists():
                     alt = [rgb_path.with_suffix(".jpg"), rgb_path.with_suffix(".jpeg")]
                     rgb_path = next((p for p in alt if p.exists()), None)
                 if rgb_path is None: 
-                    # 若缺少 RGB，无法前向；按你的设计这类样本跳过
+
                     continue
                 rgb = read_rgb_image(str(rgb_path)).unsqueeze(0).to(args.device)
 
@@ -820,7 +772,7 @@ def main():
             if last_xk is not None:
                 save_xk_global(out_dir, unwrap(model).corr.freqs_hz, last_xk)
 
-        # 保存 metrics
+
         metrics = {}
         if counted > 0:
             metrics["MAE_m"]  = float(np.mean(maes))

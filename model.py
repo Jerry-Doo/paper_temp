@@ -1,14 +1,3 @@
-# ============================================================
-# Physics-aware iToF network (From-Depth) — Environment-free, fixed
-# * Depth+RGB -> synth 4-phase (alpha * falloff * cos^η * waveform), S2 noise, map to [0,1]
-# * PhaseMix (optional): [p0,p1,p2,p3, DC, Re, Im]
-# * U-shape backbone; Mamba blocks (optional, force-FP32 for stability) or Conv fallback
-# * Heads: Depth (full-res), Global waveform x_k (2K=30)
-# * Loss: MAE + SSIM + Multi-scale ZNCC + frequency L1 prior (global waveform)
-# * Intrinsics: depth_z -> range r via ray-norm; t=2r/c; cos(theta) grid for synthesis
-# * Robustness: nan_to_num; sanitize_() after step
-# ============================================================
-
 from __future__ import annotations
 import math, contextlib
 from typing import Optional, Tuple, Union, List
@@ -17,15 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------- try mamba backbone (fallback to conv) ----------
 _HAS_MAMBA = True
 try:
-    from mamba_ssm import Mamba  # pip install mamba-ssm
+    from mamba_ssm import Mamba 
 except Exception:
     _HAS_MAMBA = False
 
-# -------------------- utilities --------------------
-_SPEED_OF_LIGHT = 299_792_458.0  # m/s
+_SPEED_OF_LIGHT = 299_792_458.0 
 
 
 def build_freq_list(base_hz: float = 50e6) -> torch.Tensor:
@@ -51,13 +38,11 @@ def _nan_safe(x: torch.Tensor, minv: float | None = None, maxv: float | None = N
         x = x.clamp(lo, hi)
     return x
 
-
-# ---- SSIM (single-channel) ----
 def _gaussian_window(channels: int, size: int, sigma: float, device, dtype):
     coords = torch.arange(size, device=device, dtype=dtype) - size // 2
     g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
     g = (g / g.sum()).unsqueeze(0)
-    w = (g.t() @ g).unsqueeze(0).unsqueeze(0)  # (1,1,h,w)
+    w = (g.t() @ g).unsqueeze(0).unsqueeze(0) 
     return w.repeat(channels, 1, 1, 1)
 
 def ssim(img1: torch.Tensor, img2: torch.Tensor, max_val: float = 1.0,
@@ -78,8 +63,6 @@ def ssim(img1: torch.Tensor, img2: torch.Tensor, max_val: float = 1.0,
     den = (mu1_sq + mu2_sq + C1) * (sig1_sq + sig2_sq + C2)
     return (num / (den + 1e-8)).clamp(0.0, 1.0).mean()
 
-
-# -------------------- camera intrinsics helpers --------------------
 def _parse_intrinsics(K: Optional[torch.Tensor] = None,
                       fx: Optional[float] = None, fy: Optional[float] = None,
                       cx: Optional[float] = None, cy: Optional[float] = None,
@@ -151,11 +134,11 @@ def cosine_from_intrinsics(H: int, W: int,
     UU, VV = torch.meshgrid(u, v, indexing='xy')
     x = (UU - cx) / max(1e-6, fx)
     y = (VV - cy) / max(1e-6, fy)
-    cos = 1.0 / torch.sqrt(1.0 + x * x + y * y)  # (H,W)
+    cos = 1.0 / torch.sqrt(1.0 + x * x + y * y) 
     return cos.clamp(0.0, 1.0).view(1, 1, H, W)
 
 
-# -------------------- PhaseMix --------------------
+
 def phasemix_cat(I: torch.Tensor) -> torch.Tensor:
     """
     I: (B,4,H,W) with order [0, π/2, π, 3π/2]
@@ -168,7 +151,7 @@ def phasemix_cat(I: torch.Tensor) -> torch.Tensor:
     return torch.cat([I, DC, Re, Im], dim=1)
 
 
-# -------------------- correlation synthesizer (no env) --------------------
+
 class CorrelationSynthesizer(nn.Module):
     r"""
     y(t) = b + Σ_k [ a_k cos(ω_k t + φ) + s_k sin(ω_k t + φ) ]
@@ -190,7 +173,7 @@ class CorrelationSynthesizer(nn.Module):
         self.use_soft_clip = bool(use_soft_clip)
         self.soft_clip_temp = float(soft_clip_temp)
 
-        # training-time noise ranges (configured outside)
+
         self._noise_read = (0.001, 0.01)
         self._noise_shot = (0.0,   0.02)
         self._noise_offs = (-0.02, 0.02)
@@ -261,7 +244,7 @@ class CorrelationSynthesizer(nn.Module):
         """
         out = (alpha * falloff * cos^eta) * y_signal   (NO env terms)
         """
-        y_signal = self.sample_map(xk, t_map)  # (B,4,H,W)
+        y_signal = self.sample_map(xk, t_map)
         B, _, H, W = y_signal.shape
         device, dtype = y_signal.device, y_signal.dtype
 
@@ -298,7 +281,7 @@ class CorrelationSynthesizer(nn.Module):
         """Map [0..2b] -> [0..1]."""
         return (_nan_safe(y) / (2.0 * self.dc_baseline)).clamp(0.0, 1.0)
 
-    # ----- noise in unit domain (S2 path helper) -----
+
     def _paper_noise_unit(self, y01: torch.Tensor) -> torch.Tensor:
         x = _nan_safe(y01, 0.0, 1.0)
         B, C, H, W = x.shape
@@ -358,7 +341,7 @@ class MambaBlock2D(nn.Module):
         if not self.use_mamba:
             return x + self.block(x)
 
-        # 强制 Mamba 在 FP32 里跑，避免 AMP(bf16/fp16) 溢出
+        
         ctx = contextlib.nullcontext()
         if x.is_cuda and self.force_fp32:
             ctx = torch.autocast(device_type='cuda', enabled=False)
@@ -406,7 +389,7 @@ class Up(nn.Module):
     def forward(self, x): return self.op(x)
 
 
-# -------------------- backbone --------------------
+
 class BackboneUShape(nn.Module):
     """
     in: 7ch (PhaseMix) or 4ch (raw phases)
@@ -455,7 +438,7 @@ class BackboneUShape(nn.Module):
         return d1, depth_raw, xk_raw
 
 
-# -------------------- RGB -> Albedo (reflectance) --------------------
+
 class RGBAlbedoEstimator(nn.Module):
     def __init__(self, dim: int = 64, alpha_min: float = 0.2, alpha_max: float = 1.5, srgb_gamma: float = 2.2):
         super().__init__()
@@ -483,7 +466,7 @@ class RGBAlbedoEstimator(nn.Module):
         return _nan_safe(alpha, self.alpha_min, self.alpha_max)
 
 
-# -------------------- main network --------------------
+
 class PhaseMambaNet(nn.Module):
     def __init__(self,
                  dim: int = 160,
@@ -506,7 +489,7 @@ class PhaseMambaNet(nn.Module):
         self.use_rgb_albedo = bool(use_rgb_albedo)
         self.use_phasemix = bool(use_phasemix)
 
-        # synthesizer (no env)
+        
         self.corr = CorrelationSynthesizer(base_freq_hz=base_freq_hz, dc_baseline=1.0)
 
         # backbone
@@ -514,14 +497,14 @@ class PhaseMambaNet(nn.Module):
         self.backbone = BackboneUShape(in_ch=in_ch, dim=dim, n1=n1, n2=n2, n3=n3,
                                        use_skip=use_skip, use_mamba=use_mamba, mamba_force_fp32=mamba_force_fp32)
 
-        # global waveform (post-box param)
-        self.k_freq = int(build_freq_list(base_freq_hz).numel())   # 15
-        self.k_param = 2 * self.k_freq                             # 30
+        
+        self.k_freq = int(build_freq_list(base_freq_hz).numel())   
+        self.k_param = 2 * self.k_freq                             
         self.register_buffer("xk_min", torch.zeros(1, self.k_param))
         self.register_buffer("xk_max", torch.zeros(1, self.k_param))
         self.global_xk_logits = nn.Parameter(torch.zeros(self.k_param))
 
-        # 默认安全盒子，避免退化
+        
         self._init_default_waveform_box(spread=0.8)
 
         # albedo
@@ -530,16 +513,13 @@ class PhaseMambaNet(nn.Module):
         else:
             self.albedo_net = None
 
-    # ---- waveform default+bounds setter ----
+    
     @torch.no_grad()
     def _init_default_waveform_box(self, spread: float = 0.8):
-        """
-        给每个频率 (a_k, s_k) 对称盒子，使 Σ_k (|a_k| + |s_k|) ≲ spread。
-        spread 按 DC=1.0 归一化。
-        """
+        
         device = self.xk_min.device
         K = self.k_freq
-        # 也可以按 1/f^alpha 加权；这里均分即可
+        
         per = float(spread) / max(K, 1)
         a_min = -per * torch.ones(K, device=device)
         a_max =  per * torch.ones(K, device=device)
@@ -547,7 +527,7 @@ class PhaseMambaNet(nn.Module):
         s_max =  per * torch.ones(K, device=device)
         self.xk_min.copy_(torch.cat([a_min, s_min])[None])
         self.xk_max.copy_(torch.cat([a_max, s_max])[None])
-        self.global_xk_logits.zero_()  # 盒子中心（logits=0）
+        self.global_xk_logits.zero_()
 
     @torch.no_grad()
     def set_waveform_box(self, xk_min: torch.Tensor, xk_max: torch.Tensor):
@@ -558,7 +538,7 @@ class PhaseMambaNet(nn.Module):
             xk_max = torch.cat([xk_max, xk_max], dim=0)
         assert xk_min.numel() == xk_max.numel() == 2 * self.k_freq, "xk_min/xk_max 维度必须为 2K"
 
-        # 避免零宽盒子：轻微撑开
+        
         same = (xk_max <= xk_min)
         if same.any():
             delta = 1e-3
@@ -571,7 +551,7 @@ class PhaseMambaNet(nn.Module):
         mid = 0.5 * (self.xk_min + self.xk_max)
         rng = (self.xk_max - self.xk_min).clamp_min(1e-6)
         init = (mid - self.xk_min) / rng
-        init = init.clamp(1e-4, 1.0 - 1e-4)  # 安全 logit
+        init = init.clamp(1e-4, 1.0 - 1e-4)
         self.global_xk_logits.copy_(torch.logit(init).squeeze())
 
     def _xk_from_post_box(self) -> torch.Tensor:
@@ -597,18 +577,15 @@ class PhaseMambaNet(nn.Module):
             self.global_xk_logits.data = torch.nan_to_num(
                 self.global_xk_logits.data, nan=0.0, posinf=8.0, neginf=-8.0)
 
-    # ---- training path: depth+rgb -> synth -> backbone -> depth + xk ----
+    
     def forward_from_depth_train(self, gt_depth: torch.Tensor,
                                  rgb: Optional[torch.Tensor],
                                  intrinsics: Optional[Union[torch.Tensor, Tuple[float,float,float,float], dict]],
                                  to_unit: bool = True, rgb_is_srgb: bool = True):
-        # quick guard：若盒子退化，重置为安全默认盒子
+        
         print("gt_depth[m]:", gt_depth.min().item(), gt_depth.mean().item(), gt_depth.max().item())
 
-        # 构造 t_map 之后，复用你已有代码得到 z_approx（与观测路径一致）
-        # 在 sample_map_physics 内部我们有：
-        #   z_approx = t_map * (c/2)  # 单位米
-        # 你可以临时把 z_approx.mean() 打出来（或复制 falloff 到外面打）
+
 
         
         if torch.allclose(self.xk_min, self.xk_max):
@@ -627,12 +604,12 @@ class PhaseMambaNet(nn.Module):
         else:
             alpha_map = torch.ones((B,1,H,W), device=device, dtype=torch.float32)
 
-        # cos(theta) grid
+        
         ray_cos = None
         if intrinsics is not None:
             ray_cos = cosine_from_intrinsics(H, W, intrinsics, device, dtype=gt_depth.dtype)
 
-        # depth -> t (观测路径)
+        
         if intrinsics is not None and self.depth_is_z:
             if torch.is_tensor(intrinsics) and intrinsics.numel() == 9:
                 t_map = depth_to_phase_t_intrinsics(gt_depth, K=intrinsics, depth_is_z=True)
@@ -650,31 +627,31 @@ class PhaseMambaNet(nn.Module):
         else:
             t_map = depth_to_phase_t(gt_depth)
 
-        # waveform params
+        
         xk = self.get_global_xk().to(device)
         xkB = xk.expand(B, -1)
 
-        # synth (no env)
+        
         I_raw = self.corr.sample_map_physics(
             xkB, t_map, alpha=alpha_map, ray_cos=ray_cos,
             cos_power=self.cos_power, use_falloff=self.use_falloff
         )
 
-        # noise-before-normalize (S2)
+        
         if self.training:
             peak = 2.0 * self.corr.dc_baseline
             I_raw = self.corr.paper_noise_like(I_raw, peak=peak)
-        I_obs01 = self.corr.to_unit(I_raw) if to_unit else I_raw  # (B,4,H,W) in [0,1]
+        I_obs01 = self.corr.to_unit(I_raw) if to_unit else I_raw
 
-        # PhaseMix -> 7ch or keep 4ch
+        
         x_in = phasemix_cat(I_obs01) if self.use_phasemix else I_obs01
 
-        # backbone -> depth + xk_raw (unused because global xk)
+        
         _, depth_raw, _ = self.backbone(x_in)
         depth = (torch.tanh(depth_raw.clamp(-3, 3)) * 0.5 + 0.5) * self.dmax
         depth = _nan_safe(depth, 0.0, self.dmax)
 
-        # pred 4-phase for ZNCC —— 与观测路径一致的 t_map
+        
         if intrinsics is not None and self.depth_is_z:
             if torch.is_tensor(intrinsics) and intrinsics.numel() == 9:
                 t_pred = depth_to_phase_t_intrinsics(depth, K=intrinsics, depth_is_z=True)
@@ -705,13 +682,10 @@ class PhaseMambaNet(nn.Module):
         }
         return xkB, depth, extras
 
-    # ---- inference from 4-phase only ----
+    
     @torch.no_grad()
     def infer_from_four_phase(self, I_obs01: torch.Tensor):
-        """
-        I_obs01: (B,4,H,W) in [0,1]; order [0, π/2, π, 3π/2]
-        return: xk(B,30), depth(B,1,H,W)
-        """
+    
         self.eval()
         device = next(self.parameters()).device
         I_obs01 = I_obs01.to(device, dtype=torch.float32).clamp(0.0, 1.0)
@@ -722,7 +696,7 @@ class PhaseMambaNet(nn.Module):
         return xk, depth
 
 
-# -------------------- loss --------------------
+
 class PhaseMambaPhysLoss(nn.Module):
     def __init__(self,
                  mae_w: float = 1.0,
@@ -792,7 +766,7 @@ class PhaseMambaPhysLoss(nn.Module):
                 pp = F.avg_pool2d(pred01, kernel_size=s, stride=s)
                 oo = F.avg_pool2d(obs01,  kernel_size=s, stride=s)
             z = self.zncc(pp, oo)
-            zs.append(w * (1.0 - z))  # 损失项
+            zs.append(w * (1.0 - z))
             Wsum += w
         return sum(zs) / max(Wsum, 1e-6)
 
@@ -822,16 +796,16 @@ class PhaseMambaPhysLoss(nn.Module):
         # MAE
         mae = F.l1_loss(pred_depth, gt_depth)
 
-        # SSIM on depth (unit)
+
         pd = (pred_depth / max(1e-6, self.dmax_for_ssim)).clamp(0, 1)
         gd = (gt_depth   / max(1e-6, self.dmax_for_ssim)).clamp(0, 1)
         ssim_val = ssim(pd, gd, max_val=self.ssim_max_val).clamp(0.0, 1.0)
         ssim_loss = 1.0 - ssim_val
 
-        # multi-scale ZNCC
+
         zncc_loss = self._ms_zncc(pred_four_phase01, obs_four_phase01)
 
-        # Freq prior
+
         freq_prior = self._freq_l1_prior(pred_xk)
 
         total = (self.mae_w * mae + self.ssim_w * ssim_loss +
