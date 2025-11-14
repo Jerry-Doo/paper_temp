@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 trainn.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train.py \
   --gt_dir ./nyu_output/depths --rgb_dir ./nyu_output/images \
   --depth_scale 1000 --no-depth_is_z --dmax 10 \
   --epochs 2000 --early_stop --es_metric val_mae \

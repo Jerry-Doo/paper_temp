@@ -1,36 +1,63 @@
-# Physics-aware iToF (4‑phase) — From‑Depth Training + Measured Inference
+# PhaseMambaNet
+### Physics-Aware Indirect Time-of-Flight (iToF) Network
 
-本仓库实现了基于 **物理可微相关器** 的 iToF 深度重建。训练阶段仅需 **GT 深度**：
-GT → 合成 4 相位 (含环境 + 几何衰减 falloff + 噪声) → Backbone(Mamba) → 粗深度 d1 →
-再合成 → **残差** → **CL‑Refiner** → 最终深度 d2 → 自一致 **ZNCC** 监督。  
-推理阶段输入 **实测四相位图**，按训练同样的闭环路径得到 d2。
+**PhaseMambaNet** is a physics-guided neural network for indirect Time-of-Flight imaging.  
+In *From-Depth* training mode, the model starts from ground-truth depth and RGB, synthesizes physically plausible 4-phase correlation measurements, and trains a U-shape backbone (with optional Mamba blocks) to jointly recover depth and a global correlation waveform.
 
 ---
 
-## 0. 环境
+## Key Features
 
-本仓库提供 `environment.yml`（你给的版本）：
+### Differentiable Correlation Synthesizer
+- 15 modulation frequencies (50 MHz × {1..19}, excluding multiples of 4).
+- Learnable global waveform coefficients x_k = [a_1..a_K, s_1..s_K].
+- Includes range falloff (1/r²), cosine-shading (cos^η θ), and per-pixel albedo.
+- Converts depth to round-trip time using camera intrinsics.
+- Environment-free formulation (no ambient light).
 
-```yaml
-name: cvpr
-channels:
-  - defaults
-  - conda-forge
-  - pytorch
-channel_alias: https://mirrors.aliyun.com/anaconda/
-show_channel_urls: true
-dependencies:
-  - python=3.9
-  - numpy
-  - scipy
-  - matplotlib
-  - scikit-learn
-  - pytorch
-  - torchvision
-  - torchaudio
-  - cudatoolkit=11.3
-  - pip
-  - pip:
-      - opencv-python
-      - tqdm
-      - tensorboard
+### Realistic Noise Model (S2 Path)
+- Readout noise
+- Shot noise
+- Row/column fixed-pattern noise
+- Gain/offset jitter
+- N-bit quantization (default: 12-bit)
+- Noise added before normalization to [0,1].
+
+### Global Waveform Parameterization
+- 30-D global learnable vector constrained by a post-box.
+- Ensures waveform stability and hardware-feasible amplitude.
+
+### RGB-Driven Albedo Estimation
+- Lightweight CNN predicts per-pixel reflectance α(x,y).
+- Supports sRGB-to-linear conversion.
+- Helps separate geometry (depth) from appearance (albedo).
+
+### U-Shape Backbone with Optional Mamba Blocks
+Input:
+- 4-phase (B,4,H,W), or
+- 7-channel PhaseMix (DC, Re, Im)
+
+Output:
+- Depth map (B,1,H,W)
+- Global waveform coefficients (B,30)
+
+---
+
+## Training Pipeline (From-Depth)
+1. Convert ground-truth depth → round-trip time via intrinsics.
+2. Synthesize clean 4-phase measurements.
+3. Add noise + quantize + normalize.
+4. Apply PhaseMix and feed into backbone.
+5. Predict depth.
+6. Re-synthesize 4-phase from predicted depth.
+7. Compute physics-aware losses.
+
+---
+
+## Loss Functions
+- Depth MAE  
+- Depth SSIM  
+- Multi-scale ZNCC  
+- Frequency-weighted L1 prior on waveform parameters  
+
+---
